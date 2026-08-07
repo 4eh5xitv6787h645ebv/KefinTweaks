@@ -98,13 +98,23 @@
  *     config is a silent dedupe (you get the existing instance back);
  *     the same name with a DIFFERENT config registers as "name#2" and warns.
  *
- *   • WINDOW CONFIG: window.JellyfinRefreshKitConfig (the 1.x singular form)
- *     applies ONLY to the FIRST instance registered on the page — that keeps
- *     every existing single-plugin adoption byte-compatible. For targeted
- *     config use the keyed form: window.JellyfinRefreshKitConfigs =
- *     { "KefinTweaks": {...}, "DemoPack": {...} } — each entry merges over
- *     (and wins against) the matching instance's tag attributes. Priority per
- *     instance: keyed entry > singular (first instance only) > data-* > defaults.
+ *   • WINDOW CONFIG: window.JellyfinRefreshKitConfig (the 1.x singular form) is
+ *     read by EACH COPY at its own tag position, synchronously, in the same
+ *     breath as document.currentScript — so it configures the tag it was
+ *     authored next to, not "whichever instance happened to register first".
+ *     A single-plugin page behaves exactly as it did in 1.x. On a page where
+ *     several adopters each write the singular global before their own tag,
+ *     each one lands on its own instance. The manager keeps a guarded fallback
+ *     for copies that cannot read it themselves (pre-2.1 copies, and eval'd
+ *     copies with no currentScript): it applies the singular global to the
+ *     FIRST registration only, and SKIPS it with one warning when the global's
+ *     name/versionUrl disagrees with the registering tag's own.
+ *     For targeted config use the keyed form: window.JellyfinRefreshKitConfigs
+ *     = { "KefinTweaks": {...}, "DemoPack": {...} } — each entry merges over
+ *     (and wins against) the matching instance's tag attributes, and is looked
+ *     up under the instance's FINAL resolved name (including an
+ *     "instance-<N>" fallback name). Priority per instance:
+ *     keyed entry > singular > data-* > defaults.
  *
  * ---------------------------------------------------------------------------
  * REGISTRATION CONTRACT (v1) — FROZEN. This section is the compatibility
@@ -128,11 +138,23 @@
  *          1.x wrapper (double-versioning, double reload engines). Mixing
  *          1.x + 2.x on one page means the 1.x-shipping plugin should upgrade
  *          its kit copy; until then only the 1.x plugin is served.
+ *       RECOVERY (2.1.0, additive — clause 2 semantics are unchanged): the
+ *          manager also publishes itself on the NON-ENUMERABLE window property
+ *          __jellyfinRefreshKitManager, and window.JellyfinRefreshKit is
+ *          installed non-configurable. A copy whose clause-2 inspection finds
+ *          no usable __registerInstance consults that backup BEFORE taking
+ *          clause 2c, so a manager whose global was clobbered (by a 1.x copy
+ *          running second, or by an unrelated plugin) is recovered instead of
+ *          silently stranding every later copy.
  *  3. manager.__registerInstance(config, kitVersion) → handle | null:
  *       • config: a PLAIN OBJECT of tag-level options using the documented
  *         option names (name, versionUrl, versionJsonField, getVersion,
  *         pollSeconds, idleSeconds, assetPatterns, entryScripts,
- *         entryTimeoutMs, mode, onUpdateAvailable, reloadBudget). The MANAGER
+ *         entryTimeoutMs, mode, onUpdateAvailable, reloadBudget, bootVersion —
+ *         plus the private marker `__singularApplied`, set by a 2.1+ copy that
+ *         already merged window.JellyfinRefreshKitConfig over its own tag
+ *         config, so the manager does not apply it a second time somewhere
+ *         else; an older manager simply ignores the unknown key). The MANAGER
  *         normalizes and clamps with its own rules and MUST ignore unknown
  *         keys — that is what lets an older manager accept a config written
  *         for a newer kit. The manager also applies the window config layers
@@ -221,12 +243,28 @@
  * ---------------------------------------------------------------------------
  * KNOWN, DELIBERATE LIMITATIONS
  * ---------------------------------------------------------------------------
- * • WITHOUT bootstrap mode, the FIRST page load after adopting the kit is
- *   inherently unversioned: the host bootstrap may create its script elements
- *   before the version has resolved. Those pass through untouched. From the next
- *   load onwards everything is versioned. This is a one-time cost, not a
- *   recurring bug — and bootstrap mode removes it entirely, because the kit
- *   itself decides when the entries load.
+ * • WITHOUT bootstrap mode (classic adoption) EVERY page load races the version
+ *   fetch. The kit holds no cross-load memory of the version: baselineVersion
+ *   starts null on every load and the version endpoint is fetched no-store, so
+ *   load 2 and load 200 are in exactly the state load 1 was. Any asset the host
+ *   bootstrap creates SYNCHRONOUSLY at parse time — before the fetch resolves —
+ *   is therefore unversioned on every load, not just the first, and the browser
+ *   keeps serving whatever it cached for that bare URL. Everything created
+ *   AFTER the version resolves is versioned, which is most of a real
+ *   collection's surface but is a per-load property, not a one-time cost.
+ *   Only BOOTSTRAP MODE removes the race, because there the kit itself decides
+ *   when the entries load. Alternatively, seed the baseline from the document
+ *   with `bootVersion` / data-boot-version (below) so load N+1 starts already
+ *   versioned.
+ * • `bootVersion` / data-boot-version seeds the baseline from the identity of
+ *   the build that SERVED this document, which is what closes the
+ *   page-serve → first-poll blind spot (an update landing in that window is
+ *   otherwise absorbed into the baseline and never detected). It must name the
+ *   SAME identity the version endpoint reports, or every load looks like an
+ *   update: RefreshKit.cs emits data-boot-version="{CacheKey}", so pair it with
+ *   data-version-json-field="CacheKey". The kit self-heals a mismatch — after
+ *   one reload that does not change the served boot identity it discards the
+ *   seed with a warning and falls back to the first-poll baseline.
  * • WITH bootstrap mode, one file per collection remains unversioned and
  *   un-fixable from JS: the kit's own <script src> in index.html. Something
  *   has to be the loader, and the loader cannot cache-bust itself. The
@@ -246,8 +284,21 @@
  *   go inert with one warning); a 1.x copy that runs SECOND was never
  *   multi-instance-aware and will double-wrap createElement on top of the 2.x
  *   manager — harmless for correctness (the inner wrapper sees already-
- *   versioned URLs and passes them through) but sloppy. Either way: the
- *   1.x-shipping plugin should upgrade its kit copy.
+ *   versioned URLs and passes them through) but sloppy. Since 2.1.0 it can no
+ *   longer STRIP the 2.x manager: window.JellyfinRefreshKit is non-configurable
+ *   and a backup handle is kept (REGISTRATION CONTRACT clause 2, RECOVERY), so
+ *   later 2.x copies still register. Either way: the 1.x-shipping plugin should
+ *   upgrade its kit copy.
+ * • A VERSION SOURCE THAT FLAPS (two nodes behind a round-robin proxy reporting
+ *   different build identities for the same release, a rolling deploy) would
+ *   otherwise reload the tab once per poll forever, because each reload is
+ *   inside its own budget window and so is always affordable. Two defences,
+ *   both since 2.1.0: a candidate version must be seen on TWO consecutive
+ *   observations before it arms a reload, and a tab that has already reloaded
+ *   X → Y refuses to auto-reload back Y → X (the flip record lives in
+ *   sessionStorage, so it is per-tab and survives the reloads it is policing).
+ *   The kit logs one line and keeps versioning URLs; it cannot make an unstable
+ *   endpoint stable — serve one identity per release across all nodes.
  * • A CDN's own "@latest" resolution TTL is invisible to JavaScript. jsDelivr
  *   caches the @latest → tag mapping for up to 24h; no amount of ?v= changes
  *   that, because the STALE FILE IS THE CORRECT RESPONSE for that URL. Pin a
@@ -271,8 +322,15 @@
      *   2.0.0 — multi-instance: manager + named instances, one shared
      *           interceptor and reload engine, registration contract v1 so
      *           multiple kit copies (even different versions) cohabit a page.
+     *   2.1.0 — reload-safety and attribution fixes, plus `bootVersion`:
+     *           a budget-refused update is deferred, never discarded; a
+     *           candidate version must be confirmed twice and a version flap
+     *           cannot loop the tab; entries that loaded unversioned no longer
+     *           poison the baseline; the singular window config follows its own
+     *           tag; the manager global can no longer be clobbered; classic
+     *           mode 'off' still resolves one version so URLs stay versioned.
      */
-    var KIT_VERSION = '2.0.0';
+    var KIT_VERSION = '2.1.0';
 
     /**
      * @type {number} Registration-contract revision this copy speaks (see the
@@ -286,6 +344,27 @@
 
     /** @type {string} Shared storage key for the cross-tab reload budget. */
     var BUDGET_KEY = 'jellyfin-refresh-kit-budget-v1';
+
+    /**
+     * Per-TAB (sessionStorage) record of version transitions this tab has
+     * already reloaded for: "<instance>|<from>><to>". It exists to break a
+     * flapping version source — if we reloaded X → Y and are now asked to go
+     * Y → X, the endpoint is oscillating, not releasing.
+     * @type {string}
+     */
+    var FLIP_KEY = 'jellyfin-refresh-kit-flips-v1';
+
+    /**
+     * Per-TAB record of one-shot recoveries already spent this browsing
+     * session, so a chronically broken endpoint cannot turn a recovery into a
+     * reload loop. Holds instance-scoped markers (unversioned-entry recovery,
+     * boot-seed disagreement).
+     * @type {string}
+     */
+    var RECOVERY_KEY = 'jellyfin-refresh-kit-recovery-v1';
+
+    /** @type {number} Cap on remembered flip records (per tab, all instances). */
+    var MAX_FLIP_RECORDS = 24;
 
     /** @type {number} Rolling window for the reload budget, in ms. */
     var BUDGET_WINDOW_MS = 60000;
@@ -311,6 +390,18 @@
 
     /** @type {number} Hard cap on consecutive blocked-reload retries (~10 min). */
     var MAX_BLOCKED_RETRIES = 600;
+
+    /**
+     * Delay before the confirmation fetch that promotes a freshly-sighted
+     * candidate version into a real update. A candidate must be seen TWICE in
+     * a row (with no sighting of the baseline in between) before it can arm a
+     * reload, which is what stops an oscillating version source from reloading
+     * the tab once per poll. Waiting a whole pollSeconds for that second
+     * observation would double every adopter's update latency, so the kit
+     * schedules the confirmation itself, shortly after the first sighting.
+     * @type {number}
+     */
+    var VERSION_CONFIRM_MS = 1500;
 
     /**
      * Bootstrap mode only: how long to wait for the FIRST version fetch before
@@ -367,6 +458,7 @@
      * @property {string}   [name]              Instance name. Default: derived from versionUrl's parent folder, else "instance-<index>".
      * @property {string}   [versionUrl]        Endpoint returning the current version. Required for polling.
      * @property {string}   [versionJsonField]  If set, the response is parsed as JSON and this field is read (e.g. "version").
+     * @property {string}   [bootVersion]       Identity of the build that SERVED this document, stamped into the tag by the server. Seeds the baseline so an update landing between page-serve and the first poll is detected instead of absorbed. Must name the same identity the version endpoint reports.
      * @property {() => Promise<string>} [getVersion] Config-object only. Overrides versionUrl entirely.
      * @property {number}   [pollSeconds]       Poll interval while visible. Default 60, clamped 15–3600.
      * @property {number}   [idleSeconds]       Required user-idle time before an auto reload. Default 5, clamped 0–300. Page-level reloads use the MAX among instances wanting one.
@@ -383,6 +475,7 @@
         name: '',
         versionUrl: '',
         versionJsonField: '',
+        bootVersion: '',
         getVersion: null,
         pollSeconds: 60,
         idleSeconds: 5,
@@ -404,10 +497,10 @@
      * which is why the window-config path exists as an escape hatch.
      *
      * Attribute names are the kebab-case form of the option names:
-     *   data-name, data-version-url, data-version-json-field, data-poll-seconds,
-     *   data-idle-seconds, data-asset-patterns (comma-separated), data-mode,
-     *   data-reload-budget, data-entry-scripts (comma-separated, ORDER MATTERS),
-     *   data-entry-timeout-ms
+     *   data-name, data-version-url, data-version-json-field, data-boot-version,
+     *   data-poll-seconds, data-idle-seconds, data-asset-patterns
+     *   (comma-separated), data-mode, data-reload-budget, data-entry-scripts
+     *   (comma-separated, ORDER MATTERS), data-entry-timeout-ms
      *
      * @returns {Partial<RefreshKitConfig>}
      */
@@ -420,6 +513,7 @@
         if (d.name) out.name = d.name;
         if (d.versionUrl) out.versionUrl = d.versionUrl;
         if (d.versionJsonField) out.versionJsonField = d.versionJsonField;
+        if (d.bootVersion) out.bootVersion = d.bootVersion;
         if (d.pollSeconds) out.pollSeconds = Number(d.pollSeconds);
         if (d.idleSeconds) out.idleSeconds = Number(d.idleSeconds);
         if (d.mode) out.mode = /** @type {any} */ (d.mode);
@@ -449,18 +543,70 @@
     // registrant (REGISTRATION CONTRACT clause 2).
     var tagConfig = safe(readScriptTagConfig, {}) || {};
 
+    /**
+     * The 1.x singular window config belongs to the TAG it was authored next
+     * to, not to "whichever instance registers first". README §(a) documents
+     * writing `window.JellyfinRefreshKitConfig = {...}` in an inline script
+     * immediately before the kit's own tag — which is the ONLY way a bare tag
+     * can pass a RegExp assetPattern, getVersion, or onUpdateAvailable. So each
+     * copy reads it HERE, in the same synchronous breath that captured
+     * currentScript, and merges it over its own data-* before registering.
+     *
+     * On a single-adopter page this is byte-identical to 1.x (window wins over
+     * data-*, both win over defaults) — deliberately unguarded here, because
+     * narrowing it would change 1.x semantics for the one shape that has always
+     * worked. On a multi-adopter page it is the only reading that attributes
+     * each config to its author. One residual ambiguity survives and cannot be
+     * resolved from a single global: if a page mixes a pre-2.1 copy with a 2.1+
+     * copy and BOTH rely on the singular form, the 2.1+ copy reads whichever
+     * value of the global is live at its own tag. Multi-adopter pages should
+     * use the keyed form (window.JellyfinRefreshKitConfigs), which is
+     * unambiguous by construction. `__singularApplied`
+     * tells the manager we already consumed the global so its own fallback
+     * (which serves pre-2.1 and eval'd copies) does not re-apply it somewhere
+     * else; an older manager simply ignores the unknown key, which leaves the
+     * pre-2.1 behaviour exactly as it was.
+     */
+    var ownConfig = (function () {
+        var out = {};
+        var k;
+        for (k in tagConfig) {
+            if (Object.prototype.hasOwnProperty.call(tagConfig, k)) out[k] = tagConfig[k];
+        }
+        var w = safe(function () {
+            var g = window.JellyfinRefreshKitConfig;
+            return (g && typeof g === 'object') ? g : null;
+        }, null);
+        if (w) {
+            for (k in w) { if (Object.prototype.hasOwnProperty.call(w, k)) out[k] = w[k]; }
+            out.__singularApplied = true;
+        }
+        return out;
+    })();
+
     // ─────────────────────────────────────────────────────────────────────────
     // Role decision (REGISTRATION CONTRACT clause 2)
     // ─────────────────────────────────────────────────────────────────────────
 
-    var existingManager = safe(function () { return window.JellyfinRefreshKit; }, null);
+    var existingManager = safe(function () { return window.JellyfinRefreshKit; }, null) || null;
+    if (!existingManager || typeof existingManager.__registerInstance !== 'function') {
+        // The global is missing or is not a 2.x manager. Before concluding "a
+        // 1.x singleton owns this page" (clause 2c — permanently inert), check
+        // the manager's own backup handle: a 1.x copy running SECOND, or any
+        // unrelated plugin, may simply have overwritten the global out from
+        // under a live 2.x manager. Recovering is always better than stranding.
+        var backupManager = safe(function () { return window.__jellyfinRefreshKitManager; }, null) || null;
+        if (backupManager && typeof backupManager.__registerInstance === 'function') {
+            existingManager = backupManager;
+        }
+    }
     if (existingManager) {
         if (typeof existingManager.__registerInstance === 'function') {
             // 2.x manager already installed (possibly an older or newer 2.x than
             // this copy — the contract covers both). Register and bow out: no
             // second wrapper, no listeners, no timers from this copy.
             safe(function () {
-                existingManager.__registerInstance(tagConfig, KIT_VERSION);
+                existingManager.__registerInstance(ownConfig, KIT_VERSION);
             });
         } else {
             // A 1.x singleton owns the page. It already wrapped createElement
@@ -516,6 +662,11 @@
         if (typeof cfg.onUpdateAvailable !== 'function') cfg.onUpdateAvailable = null;
         cfg.versionUrl = typeof cfg.versionUrl === 'string' ? cfg.versionUrl : '';
         cfg.versionJsonField = typeof cfg.versionJsonField === 'string' ? cfg.versionJsonField : '';
+        cfg.bootVersion = typeof cfg.bootVersion === 'string' ? cfg.bootVersion.trim() : '';
+        // A boot identity that does not look like one (an HTML error page
+        // stamped into the attribute, a template placeholder) is worse than
+        // none: it would make every load look like an update.
+        if (cfg.bootVersion.length > 200 || cfg.bootVersion.charAt(0) === '<') cfg.bootVersion = '';
         return cfg;
     }
 
@@ -545,12 +696,19 @@
      * Structural config equivalence, for silent dedupe of an accidental double
      * include of the SAME adoption. Compared on normalized configs: scalars by
      * ===, functions by reference, patterns by type + string form.
+     *
+     * `name` is deliberately NOT compared. Every caller has already established
+     * that the two configs resolve to the same BASE name (that is how the
+     * candidate was found), and the collision-suffixed variants of that base —
+     * "KefinTweaks#2", "#3" — carry the suffix in their own cfg.name. Comparing
+     * it would make a duplicate of "#2" look different from "#2" and mint a
+     * pointless "#3" whose entry chain runs the same files a second time.
      * @param {RefreshKitConfig} a
      * @param {RefreshKitConfig} b
      * @returns {boolean}
      */
     function configsEquivalent(a, b) {
-        var scalar = ['name', 'versionUrl', 'versionJsonField', 'pollSeconds', 'idleSeconds',
+        var scalar = ['versionUrl', 'versionJsonField', 'bootVersion', 'pollSeconds', 'idleSeconds',
             'entryTimeoutMs', 'mode', 'reloadBudget', 'getVersion', 'onUpdateAvailable'];
         for (var i = 0; i < scalar.length; i++) {
             if (a[scalar[i]] !== b[scalar[i]]) return false;
@@ -584,6 +742,14 @@
     var blockedRetries = 0;
     /** @type {string|null} Last recorded reason a reload was refused (diagnostics). */
     var lastBlockReason = null;
+    /**
+     * One-shot latch for the budget-refusal warning. The refusal now DEFERS
+     * instead of discarding, so it can legitimately re-fire every budget window
+     * until the window rolls; one warning per blocked episode is the signal, a
+     * warning per retry is noise. Cleared the moment a reservation succeeds.
+     * @type {boolean}
+     */
+    var warnedBudgetRefusal = false;
     /** @type {boolean} One-shot latch: warn about overlapping assetPatterns once. */
     var warnedOverlap = false;
     /** @type {boolean} True once the single createElement wrapper is installed. */
@@ -629,11 +795,17 @@
      * the manager-level versionedUrl API):
      *   • URLs already carrying v= pass through untouched, always.
      *   • All registered instances' assetPatterns are consulted; the FIRST
-     *     REGISTERED instance whose patterns match versions the URL with THAT
-     *     instance's resolved version (unresolved → pass through untouched,
-     *     same as 1.x before the first fetch).
-     *   • If MORE THAN ONE instance matches, first-registered wins and we log
-     *     ONE console.warn naming the overlap — the first time it bites, only.
+     *     REGISTERED instance whose patterns match AND has a resolved version
+     *     versions the URL with THAT instance's version. An instance that
+     *     matches but has not resolved a version yet is skipped rather than
+     *     being allowed to veto a sibling that HAS one — a URL going out
+     *     unversioned is the one outcome nobody wants, and "matched first" is
+     *     a tie-breaker between equals, not a licence to lose the version.
+     *     With no resolved version anywhere, pass through untouched (same as
+     *     1.x before the first fetch).
+     *   • If MORE THAN ONE instance matches, the winner is the first matching
+     *     instance with a version and we log ONE console.warn naming the
+     *     overlap — the first time it bites, only.
      * @param {string} url
      * @returns {string}
      */
@@ -648,18 +820,26 @@
             }
         }
         if (!matches) return url;
+
+        var chosen = null, version = null;
+        for (var m = 0; m < matches.length; m++) {
+            var candidate = matches[m].getBaselineVersion();
+            if (candidate) { chosen = matches[m]; version = candidate; break; }
+        }
+
         if (matches.length > 1 && !warnedOverlap) {
             warnedOverlap = true;
+            var winner = chosen || matches[0];
             safe(function () {
                 console.warn(LOG, 'assetPatterns OVERLAP: "' + url + '" matches instances [' +
-                    matches.map(function (m) { return m.name; }).join(', ') + ']. ' +
-                    'First-registered "' + matches[0].name + '" wins (its version is applied). ' +
+                    matches.map(function (mm) { return mm.name; }).join(', ') + ']. ' +
+                    '"' + winner.name + '" wins (its version is applied). ' +
                     'Keep patterns disjoint per collection. (Warned once.)');
             });
         }
-        var v = matches[0].getBaselineVersion();
-        if (!v) return url;
-        return appendVersion(url, v);
+
+        if (!version) return url;
+        return appendVersion(url, version);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -990,6 +1170,109 @@
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Per-tab memory: version flips and one-shot recoveries
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Read a string-array from sessionStorage. sessionStorage — not local — on
+     * purpose: both of these facts are properties of THIS TAB's history ("this
+     * tab already reloaded for that transition", "this tab already spent its
+     * one recovery"), they must survive the reloads they are policing, and they
+     * must not leak into a tab the user opened fresh.
+     * @param {string} key
+     * @returns {string[]} Always an array; [] when absent, unreadable or corrupt.
+     */
+    function readTabList(key) {
+        return safe(function () {
+            var ss = safeStorage('sessionStorage');
+            if (!ss) return [];
+            var raw = ss.getItem(key);
+            if (!raw) return [];
+            var parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed)) return [];
+            return parsed.filter(function (s) { return typeof s === 'string'; });
+        }, []) || [];
+    }
+
+    /**
+     * Append one entry to a per-tab list, de-duplicated and bounded.
+     * Best-effort: a tab with no writable sessionStorage simply loses the
+     * memory, which degrades to the pre-2.1 behaviour rather than breaking.
+     * @param {string} key
+     * @param {string} entry
+     * @param {number} cap
+     */
+    function pushTabList(key, entry, cap) {
+        safe(function () {
+            var ss = safeStorage('sessionStorage');
+            if (!ss) return;
+            var list = readTabList(key).filter(function (s) { return s !== entry; });
+            list.push(entry);
+            if (list.length > cap) list = list.slice(list.length - cap);
+            ss.setItem(key, JSON.stringify(list));
+        });
+    }
+
+    /**
+     * @param {string} name Instance name.
+     * @param {string} from Version reloaded away FROM.
+     * @param {string} to Version reloaded TO.
+     * @returns {string} The canonical flip-record string.
+     */
+    function flipRecord(name, from, to) {
+        return name + '|' + from + '>' + to;
+    }
+
+    /**
+     * Remember that this tab reloaded `name` from `from` to `to`.
+     * @param {string} name
+     * @param {string} from
+     * @param {string} to
+     */
+    function rememberFlip(name, from, to) {
+        if (!from || !to) return;
+        pushTabList(FLIP_KEY, flipRecord(name, from, to), MAX_FLIP_RECORDS);
+    }
+
+    /**
+     * Has this tab ALREADY reloaded in the opposite direction? Going Y → X
+     * after having gone X → Y is not a release, it is an oscillating version
+     * source (two nodes behind a round-robin proxy, a rolling deploy). Each
+     * such reload sits in its own budget window, so the reload budget can never
+     * catch it — this is the only thing that can.
+     * @param {string} name
+     * @param {string} from Current baseline.
+     * @param {string} to Candidate version.
+     * @returns {boolean}
+     */
+    function isReverseFlip(name, from, to) {
+        if (!from || !to) return false;
+        return readTabList(FLIP_KEY).indexOf(flipRecord(name, to, from)) !== -1;
+    }
+
+    /**
+     * Claim a named one-shot recovery for this tab, returning false when it was
+     * already spent. Recoveries reload the page to repair a boot that went
+     * wrong; without a per-tab latch a permanently broken endpoint would repair
+     * itself into a reload loop.
+     * @param {string} marker
+     * @returns {boolean} True when the caller may proceed.
+     */
+    function claimRecovery(marker) {
+        if (readTabList(RECOVERY_KEY).indexOf(marker) !== -1) return false;
+        pushTabList(RECOVERY_KEY, marker, MAX_FLIP_RECORDS);
+        return true;
+    }
+
+    /**
+     * @param {string} marker
+     * @returns {boolean} True when this recovery was already spent in this tab.
+     */
+    function recoverySpent(marker) {
+        return readTabList(RECOVERY_KEY).indexOf(marker) !== -1;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Shared reload engine
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1026,17 +1309,23 @@
 
     /**
      * Schedule one more safety re-evaluation. Bounded so a tab left on a video
-     * forever does not tick at 1Hz for eternity — after the cap we simply wait
-     * for the next interaction or poll to re-arm.
+     * forever does not tick at 1Hz for eternity — after the cap the 1Hz loop
+     * stops and the slower re-entry points (an interaction, a tab refocus, or
+     * the next successful poll) re-test the gate instead.
+     *
+     * @param {number} [delayMs] Defaults to the 1Hz safety-gate cadence. The
+     *   budget-refusal path passes BUDGET_WINDOW_MS: nothing about that refusal
+     *   can change before the rolling window rolls, so re-testing every second
+     *   would be a thousand pointless storage reads.
      */
-    function scheduleRetry() {
+    function scheduleRetry(delayMs) {
         clearRetry();
         if (blockedRetries >= MAX_BLOCKED_RETRIES) return;
         blockedRetries++;
         retryTimer = setTimeout(function () {
             retryTimer = null;
             safe(tryReload);
-        }, RETRY_MS);
+        }, typeof delayMs === 'number' && isFinite(delayMs) ? delayMs : RETRY_MS);
     }
 
     /**
@@ -1066,23 +1355,45 @@
         clearRetry();
 
         if (!reserveReload()) {
-            safe(function () {
-                console.warn(LOG, 'reload budget exhausted (' + effectiveReloadBudget() + ' per ' +
-                    (BUDGET_WINDOW_MS / 1000) + 's) or unverifiable — not reloading. ' +
-                    'This is the loop-protection fail-closed path.');
-            });
-            // Stop trying for this window. The next poll that sees a *different*
-            // version, or a manual checkNow(), re-arms.
-            for (var i = 0; i < pending.length; i++) pending[i].updatePending = false;
+            // DEFERRED, NOT DISCARDED. The refusal is a property of a 60-second
+            // rolling window (or of storage we could not verify), not of the
+            // update — the tab that lost the race is still running stale code
+            // and still wants the reload. Clearing updatePending here is what
+            // used to strand it forever: onVersion's watermark then made every
+            // later poll, and checkNow(), a no-op for that same version.
+            //
+            // So: keep the intent, warn once per blocked episode, and re-test
+            // when the window has rolled. This mirrors the reference this was
+            // ported from (client-refresh.js: scheduleRetry(RELOAD_BUDGET_WINDOW_MS)).
+            if (!warnedBudgetRefusal) {
+                warnedBudgetRefusal = true;
+                safe(function () {
+                    console.warn(LOG, 'reload budget exhausted (' + effectiveReloadBudget() + ' per ' +
+                        (BUDGET_WINDOW_MS / 1000) + 's) or unverifiable — deferring the reload for ' +
+                        (BUDGET_WINDOW_MS / 1000) + 's. The pending update is kept; this is the ' +
+                        'loop-protection fail-closed path, not an abandonment. (Warned once per episode.)');
+                });
+            }
+            lastBlockReason = 'reload_budget';
+            scheduleRetry(BUDGET_WINDOW_MS);
             return;
         }
+        warnedBudgetRefusal = false;
 
         safe(function () {
             console.log(LOG, 'reloading to pick up: ' + pending.map(function (p) {
                 return p.name + ' ' + p.getBaselineVersion() + ' → ' + p.getLatestVersion();
             }).join(', '));
         });
-        for (var j = 0; j < pending.length; j++) pending[j].updatePending = false;
+        // Record the transition BEFORE the page goes away: on the other side of
+        // this reload it is the only evidence that a version source flapping
+        // back to where we came from is a flap and not a release.
+        for (var j = 0; j < pending.length; j++) {
+            safe(function (p) {
+                return function () { rememberFlip(p.name, p.getBaselineVersion(), p.getLatestVersion()); };
+            }(pending[j]));
+            pending[j].updatePending = false;
+        }
         safe(function () { location.reload(); });
     }
 
@@ -1147,13 +1458,62 @@
      * @param {string} name Resolved unique instance name.
      * @param {RefreshKitConfig} cfg Normalized config.
      * @param {string} sourceKitVersion KIT_VERSION of the registering copy.
+     * @param {boolean} [entriesSuppressed] Register normally but do NOT load
+     *   entryScripts: an already-registered instance is loading the same files
+     *   and loading them twice into one document is never correct.
      * @returns {Object} Internal instance record.
      */
-    function createInstance(name, cfg, sourceKitVersion) {
-        /** @type {string|null} First version ever resolved — the build this tab is running (for this instance). */
-        var baselineVersion = null;
+    function createInstance(name, cfg, sourceKitVersion, entriesSuppressed) {
+        /** Log prefix so N instances' messages stay attributable. */
+        var TAG = '[' + name + ']';
+
+        /**
+         * Marker for the one-shot per-tab recovery that fires when this
+         * instance's boot seed disagrees with its own version endpoint.
+         * @type {string}
+         */
+        var BOOT_SEED_MARKER = 'boot-seed|' + name + '|' + cfg.bootVersion;
+
+        /**
+         * Should we trust `bootVersion`? The seed is the identity of the build
+         * that SERVED this document, so it is strictly better than a first-poll
+         * baseline — but only if it names the same identity the version
+         * endpoint reports. An adopter who stamps CacheKey into the tag and
+         * points versionJsonField at a bare assembly Version has configured a
+         * permanent disagreement, and a naively-trusted seed would make every
+         * single page load look like an update and burn the reload budget.
+         *
+         * The self-heal: the first disagreement spends a one-shot recovery
+         * marked with THIS boot identity and reloads. If the reload comes back
+         * with the same boot identity still disagreeing, the server did not
+         * change — the disagreement is provenance, not an update — so the seed
+         * is discarded here, with one warning, and the instance falls back to
+         * the pre-2.1 first-poll baseline. Cost of a misconfiguration: one
+         * reload per tab session, then correct (if blind-spotted) behaviour.
+         */
+        var bootSeedRejected = !!cfg.bootVersion && recoverySpent(BOOT_SEED_MARKER);
+        if (bootSeedRejected) {
+            safe(function () {
+                console.warn(LOG, TAG, 'data-boot-version "' + cfg.bootVersion + '" still disagrees with ' +
+                    'the version endpoint after a reload, so it does not describe the same identity the ' +
+                    'endpoint reports — ignoring it and using the first-poll baseline. Point ' +
+                    'data-boot-version and the version endpoint at the SAME value (RefreshKit.cs emits ' +
+                    'data-boot-version="{CacheKey}"; pair it with data-version-json-field="CacheKey").');
+            });
+        }
+
+        /**
+         * @type {string|null} The build this tab is RUNNING for this instance.
+         * Seeded from `bootVersion` when the document told us which build
+         * produced it — that closes the page-serve → first-poll window, in
+         * which an update would otherwise be absorbed into the baseline and
+         * never detected. Otherwise established by the first successful fetch.
+         */
+        var baselineVersion = (cfg.bootVersion && !bootSeedRejected) ? cfg.bootVersion : null;
+        /** @type {boolean} True while the baseline is the un-confirmed document seed. */
+        var baselineFromBootSeed = baselineVersion !== null;
         /** @type {string|null} Most recent version seen on this instance's server endpoint. */
-        var latestVersion = null;
+        var latestVersion = baselineVersion;
         /** @type {number} Timestamp of the last version fetch attempt. */
         var lastFetchAt = 0;
         /** @type {number|null} setTimeout handle for this instance's poll loop. */
@@ -1165,19 +1525,32 @@
          * @type {string|null}
          */
         var notifiedVersion = null;
+        /**
+         * A version seen once that differs from the baseline, waiting for a
+         * second consecutive sighting before it is believed. Reset the moment
+         * the baseline is observed again, which is what makes an A→B→A→B
+         * oscillation never confirm anything.
+         * @type {string|null}
+         */
+        var candidateVersion = null;
+        /** @type {number|null} One-shot timer for the confirmation fetch. */
+        var confirmTimer = null;
+        /** @type {boolean} One-shot latch for the flap-disarm log line. */
+        var warnedFlap = false;
+        /** @type {string|null} The version pair auto-reload was disarmed for. */
+        var flapDisarmedFor = null;
         /** @type {boolean} One-shot latch so version-source failures warn exactly once. */
         var warnedFetchFailure = false;
         /** @type {boolean} True when entryScripts are configured (bootstrap mode). */
-        var bootstrapMode = cfg.entryScripts.length > 0;
+        var bootstrapMode = cfg.entryScripts.length > 0 && !entriesSuppressed;
+        /** @type {boolean} True when entryScripts exist but a sibling instance owns them. */
+        var entriesDeduped = cfg.entryScripts.length > 0 && !!entriesSuppressed;
         /** @type {boolean} One-shot latch so the entry chain can only start once. */
         var entriesStarted = false;
         /** @type {boolean} True once every entry has settled (loaded, or failed and skipped). */
         var entriesLoaded = false;
         /** @type {boolean} Did the entries get a ?v= — i.e. did the version resolve in time? */
         var entriesVersioned = false;
-
-        /** Log prefix so N instances' messages stay attributable. */
-        var TAG = '[' + name + ']';
 
         /**
          * Does this URL belong to an asset THIS instance is supposed to version?
@@ -1267,8 +1640,73 @@
                 });
         }
 
+        /** Cancel a pending candidate-confirmation fetch. */
+        function clearConfirmTimer() {
+            if (confirmTimer !== null) { clearTimeout(confirmTimer); confirmTimer = null; }
+        }
+
+        /**
+         * Ask for the second consecutive observation that promotes a candidate
+         * into a real update. Scheduled rather than waiting for the next
+         * ordinary poll, so confirmation costs ~VERSION_CONFIRM_MS instead of a
+         * whole pollSeconds.
+         */
+        function scheduleConfirm() {
+            clearConfirmTimer();
+            if (cfg.mode === 'off') return;
+            confirmTimer = setTimeout(function () {
+                confirmTimer = null;
+                safe(function () { poll(true); });
+            }, VERSION_CONFIRM_MS);
+        }
+
+        /**
+         * The entries for this instance went out with no ?v=, so the code
+         * actually running in this tab is whatever the HTTP cache happened to
+         * hold — NOT the version the endpoint has now recovered to. Adopting
+         * that version as a clean baseline is what used to leave the tab
+         * permanently stale while state() reported it healthy.
+         *
+         * So: treat it as an update and ask for ONE reload, guarded by a
+         * per-tab marker. A chronically slow or dead endpoint must fail by
+         * running last week's code, not by reload-looping the browser.
+         * @param {string} version The version the endpoint has recovered to.
+         */
+        function recoverUnversionedBoot(version) {
+            var marker = 'unversioned-entries|' + name;
+            if (cfg.mode !== 'auto') {
+                safe(function () {
+                    console.warn(LOG, TAG, 'entries loaded UNVERSIONED and the version endpoint has ' +
+                        'since recovered (' + version + '); the code in this tab may be stale. ' +
+                        "mode '" + cfg.mode + "' does not reload — refresh to converge.");
+                });
+                return;
+            }
+            if (!claimRecovery(marker)) {
+                safe(function () {
+                    console.log(LOG, TAG, 'entries loaded UNVERSIONED again; this tab has already spent ' +
+                        'its one recovery reload this session — not reloading (a dead endpoint must not loop).');
+                });
+                return;
+            }
+            safe(function () {
+                console.warn(LOG, TAG, 'entries loaded UNVERSIONED but the version endpoint has recovered (' +
+                    version + '); the loaded code may be a stale cache entry. Requesting ONE safe reload ' +
+                    '(once per tab session) to reload them version-addressed.');
+            });
+            inst.updatePending = true;
+            blockedRetries = 0;
+            safe(tryReload);
+        }
+
         /**
          * Called with each successfully fetched version for THIS instance.
+         *
+         * Shape of the decision, in order:
+         *   1. no baseline yet          → this fetch establishes it,
+         *   2. version === baseline     → nothing new; clear any candidate,
+         *   3. first sighting of a new  → hold it as a CANDIDATE and confirm,
+         *   4. second consecutive sight → announce, then (auto) arm the reload.
          * @param {string} version
          */
         function onVersion(version) {
@@ -1279,29 +1717,93 @@
                 baselineVersion = version;
                 latestVersion = version;
                 safe(function () { console.log(LOG, TAG, 'version resolved:', version); });
+                // ...unless the assets already in memory went out unversioned,
+                // in which case "the version we just resolved" describes the
+                // server, not this tab.
+                if (entriesStarted && !entriesVersioned) recoverUnversionedBoot(version);
                 return;
             }
 
             latestVersion = version;
-            // Nothing new: same build we are already running, an announcement we
-            // already made, or an auto-reload already in flight.
-            if (version === baselineVersion || version === notifiedVersion || inst.updatePending) return;
-            notifiedVersion = version;
 
-            safe(function () {
-                console.log(LOG, TAG, 'update available: ' + baselineVersion + ' → ' + version);
-            });
+            if (version === baselineVersion) {
+                // The baseline is confirmed by the server. Anything we were
+                // holding as a candidate was a blip (or a flap): drop it, so a
+                // later sighting has to earn two consecutive observations again.
+                candidateVersion = null;
+                clearConfirmTimer();
+                if (baselineFromBootSeed) baselineFromBootSeed = false;
+                return;
+            }
 
-            if (cfg.onUpdateAvailable) {
-                safe(function () { cfg.onUpdateAvailable(version, baselineVersion); });
+            // A candidate must be seen TWICE IN A ROW before it is believed.
+            // One observation is not evidence of a release: a version source
+            // that alternates between two nodes' build identities would
+            // otherwise reload this tab once per poll, forever, with every
+            // single reload comfortably inside its own budget window.
+            if (version !== candidateVersion) {
+                candidateVersion = version;
+                safe(function () {
+                    console.debug(LOG, TAG, 'candidate version ' + version + ' (baseline ' +
+                        baselineVersion + ') — confirming before acting on it');
+                });
+                scheduleConfirm();
+                return;
+            }
+            clearConfirmTimer();
+
+            // Confirmed. A boot seed that survives its first confirmed
+            // disagreement has done its job: it is a real update, not a
+            // provenance mismatch. Remember the attempt so that if the reload
+            // brings back the SAME boot identity still disagreeing, the next
+            // page discards the seed instead of reloading again.
+            if (baselineFromBootSeed) {
+                safe(function () { claimRecovery(BOOT_SEED_MARKER); });
+            }
+
+            var firstAnnouncement = version !== notifiedVersion;
+            if (firstAnnouncement) {
+                notifiedVersion = version;
+                // A genuinely new update earns a fresh 1Hz retry allowance.
+                // Repeat sightings of the SAME pending update deliberately do
+                // not, so a tab parked on a video cannot be made to tick at 1Hz
+                // for eternity — those polls re-test the gate directly instead.
+                blockedRetries = 0;
+                safe(function () {
+                    console.log(LOG, TAG, 'update available: ' + baselineVersion + ' → ' + version);
+                });
+                if (cfg.onUpdateAvailable) {
+                    safe(function () { cfg.onUpdateAvailable(version, baselineVersion); });
+                }
             }
 
             // 'notify' and 'off' stop here — a notify instance NEVER triggers the
             // shared reload; its callback above already fired.
             if (cfg.mode !== 'auto') return;
 
-            inst.updatePending = true;
-            blockedRetries = 0;
+            // Has this tab already reloaded the other way? Then the endpoint is
+            // oscillating and reloading again just walks back. Disarm the pair.
+            if (isReverseFlip(name, baselineVersion, version)) {
+                if (!warnedFlap) {
+                    warnedFlap = true;
+                    flapDisarmedFor = baselineVersion + ' ⇄ ' + version;
+                    safe(function () {
+                        console.warn(LOG, TAG, 'version FLAP: this tab already reloaded ' + version +
+                            ' → ' + baselineVersion + ', and the endpoint now reports ' + version +
+                            ' again. That is an unstable version source, not a release — auto-reload ' +
+                            'is disarmed for this pair. Serve one identity per release across all nodes.');
+                    });
+                }
+                inst.updatePending = false;
+                return;
+            }
+
+            // Arm (or RE-arm). Re-arming matters: a reload refused by the
+            // budget keeps updatePending set and is retried by the engine, but
+            // a reload abandoned any other way must be recoverable by the very
+            // next successful poll — which is exactly what the README promises
+            // and what checkNow() is for.
+            if (!inst.updatePending) inst.updatePending = true;
             safe(tryReload);
         }
 
@@ -1329,9 +1831,26 @@
             });
         }
 
-        /** Stop this instance's poll timer. */
+        /**
+         * Stop this instance's poll timer. Deliberately does NOT touch the
+         * confirmation timer: startPolling() re-arms the loop through here on
+         * every completed poll, and the confirmation is armed from inside that
+         * very poll's onVersion — clearing it here would cancel every
+         * confirmation the moment it was scheduled, and no candidate would ever
+         * be confirmed. Suspending the instance entirely is suspend()'s job.
+         */
         function stopPolling() {
             if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+        }
+
+        /**
+         * Suspend this instance completely — used when the tab goes hidden,
+         * where "a hidden tab holds ZERO timers" is a promise the kit makes.
+         * wake() re-polls and re-observes any candidate from scratch.
+         */
+        function suspend() {
+            stopPolling();
+            clearConfirmTimer();
         }
 
         /**
@@ -1470,8 +1989,9 @@
         function noteUnversionedEntries(why) {
             safe(function () {
                 var message = 'entry scripts loading UNVERSIONED — ' + why +
-                    '. Availability over freshness; the tab will pick up the new ' +
-                    'version once the endpoint recovers.';
+                    '. Availability over freshness; if the endpoint recovers, the kit treats the ' +
+                    'resolved version as an update and asks for one safe reload so the entries come ' +
+                    'back version-addressed (once per tab session).';
                 if (!warnedFetchFailure) {
                     warnedFetchFailure = true;
                     console.warn(LOG, TAG, message);
@@ -1549,7 +2069,19 @@
             } else if (cfg.mode !== 'off') {
                 safe(function () { poll(true).then(startPolling, startPolling); });
             } else {
-                safe(function () { console.log(LOG, TAG, "mode 'off' — no polling, no reloads"); });
+                // mode 'off' switches off POLLING and RELOADS — it does not
+                // switch off layer 2. Without a resolved version, versionedUrl()
+                // and the page matcher pass every one of this instance's assets
+                // through unversioned, which silently disables the kit's primary
+                // function on a flag documented as "no auto-reload". So: exactly
+                // one fetch to establish the baseline, then nothing. (Bootstrap
+                // + 'off' already did this via firstVersionAttempt(); this makes
+                // classic + 'off' behave the same way.)
+                safe(function () {
+                    console.log(LOG, TAG, "mode 'off' — one version fetch for URL versioning, " +
+                        'then no polling and no reloads');
+                });
+                safe(function () { return firstVersionAttempt(); });
             }
         }
 
@@ -1557,9 +2089,20 @@
          * Diagnostic snapshot for this instance. Field-compatible with the
          * 1.1.0 singleton state() so support workflows keep working, plus name /
          * registeredByKitVersion.
+         *
+         * On `blockReason` vs `wouldBlockNow`: blockReasonFor() is a live
+         * safety probe with no notion of pendingness, so computing it
+         * unconditionally produced snapshots reading `blockReason:
+         * 'media_element'` next to `updatePending: false` on a perfectly
+         * up-to-date tab — support then hunts a block that does not exist.
+         * Since 2.1.0 `blockReason` answers the question it is named for
+         * ("why is the pending auto-reload not happening?") and is null when
+         * nothing is pending; the always-computed hypothetical kept its value
+         * under the honest name `wouldBlockNow`.
          * @returns {Object}
          */
         function state() {
+            var idleWindow = Math.max(cfg.idleSeconds * 1000, MIN_SETTLE_MS);
             return {
                 kitVersion: KIT_VERSION,
                 name: name,
@@ -1568,13 +2111,19 @@
                 bootstrapMode: bootstrapMode,
                 entriesLoaded: entriesLoaded,
                 entriesVersioned: entriesVersioned,
+                entriesDeduped: entriesDeduped,
                 entryScripts: cfg.entryScripts.slice(),
                 version: baselineVersion,
                 latestVersion: latestVersion,
+                bootVersion: cfg.bootVersion,
+                baselineFromBootSeed: baselineFromBootSeed,
+                candidateVersion: candidateVersion,
+                flapDisarmedFor: flapDisarmedFor,
                 updatePending: inst.updatePending,
-                blockReason: cfg.mode === 'auto'
-                    ? blockReasonFor(Math.max(cfg.idleSeconds * 1000, MIN_SETTLE_MS))
+                blockReason: (cfg.mode === 'auto' && inst.updatePending)
+                    ? blockReasonFor(idleWindow)
                     : null,
+                wouldBlockNow: cfg.mode === 'auto' ? blockReasonFor(idleWindow) : null,
                 lastBlockReason: lastBlockReason,
                 idle: (Date.now() - lastInteractionAt) >= Math.max(cfg.idleSeconds * 1000, MIN_SETTLE_MS),
                 msSinceInteraction: Date.now() - lastInteractionAt,
@@ -1629,7 +2178,9 @@
             getBaselineVersion: function () { return baselineVersion; },
             getLatestVersion: function () { return latestVersion; },
             poll: poll,
-            stopPolling: stopPolling,
+            // The shared engine only ever calls this to park a hidden tab, so
+            // it gets the full suspend (poll timer AND confirmation timer).
+            stopPolling: suspend,
             wake: wake,
             start: start,
             state: state
@@ -1645,13 +2196,68 @@
     var singularConfigApplied = false;
 
     /**
+     * Apply the singular 1.x window config on behalf of a copy that could not
+     * read it itself — a pre-2.1 copy (which passes no `__singularApplied`
+     * marker) or a copy executed from eval'd text, where currentScript is null
+     * and the window config is the documented escape hatch.
+     *
+     * It is a FALLBACK, not the primary path (2.1+ copies read the global at
+     * their own tag position, which is the only reading that attributes a
+     * config to its author), and it is GUARDED: the singular global names a
+     * specific adoption via `name` / `versionUrl`, so if those disagree with
+     * the tag currently registering, this config was written for somebody else
+     * and applying it would silently repoint one plugin at another's endpoint.
+     *
+     * @param {Object} merged The registration's merged config, mutated in place.
+     * @returns {void}
+     */
+    function applySingularWindowConfigFallback(merged) {
+        safe(function () {
+            var w = window.JellyfinRefreshKitConfig;
+            if (!w || typeof w !== 'object') return;
+
+            var wName = typeof w.name === 'string' ? w.name.trim() : '';
+            var wUrl = typeof w.versionUrl === 'string' ? w.versionUrl : '';
+            var tName = typeof merged.name === 'string' ? merged.name.trim() : '';
+            var tUrl = typeof merged.versionUrl === 'string' ? merged.versionUrl : '';
+            var disagrees = (!!wName && !!tName && wName !== tName) ||
+                (!!wUrl && !!tUrl && wUrl !== tUrl);
+
+            if (disagrees) {
+                safe(function () {
+                    console.warn(LOG, 'window.JellyfinRefreshKitConfig names ' +
+                        (wName ? '"' + wName + '"' : wUrl) + ', which is not the adoption registering ' +
+                        'here (' + (tName ? '"' + tName + '"' : tUrl) + ') — NOT applying it. Use ' +
+                        'window.JellyfinRefreshKitConfigs = { "<instance name>": {...} } to configure a ' +
+                        'specific instance, or upgrade that plugin\'s kit copy to 2.1+ (which reads the ' +
+                        'singular config at its own tag).');
+                });
+                return;
+            }
+            for (var k in w) { if (Object.prototype.hasOwnProperty.call(w, k)) merged[k] = w[k]; }
+        });
+    }
+
+    /**
+     * @param {string[]} a
+     * @param {string[]} b
+     * @returns {boolean} True when both lists name the same entries in the same order.
+     */
+    function sameEntryList(a, b) {
+        if (a.length !== b.length || a.length === 0) return false;
+        for (var i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+        return true;
+    }
+
+    /**
      * Register one instance from a raw tag-level config. This is what
      * __registerInstance delegates to; the first copy's own registration goes
      * through the very same path, so there is exactly one code path.
      *
      * Merge order (last wins):
      *   defaults < data-* (rawConfig) < window.JellyfinRefreshKitConfig
-     *   (first registration only) < window.JellyfinRefreshKitConfigs[name]
+     *   (read by the copy at its own tag; manager fallback for older copies)
+     *   < window.JellyfinRefreshKitConfigs[FINAL resolved name]
      *
      * @param {Object} rawConfig Plain object of tag-level options.
      * @param {string} sourceKitVersion KIT_VERSION of the registering copy.
@@ -1665,38 +2271,44 @@
         var key;
         for (key in raw) { if (Object.prototype.hasOwnProperty.call(raw, key)) merged[key] = raw[key]; }
 
-        // 1.x back-compat: the singular window config configures the FIRST
-        // instance registered on the page (which, for a single-plugin page, is
-        // exactly the 1.x behaviour: window > data-* > defaults).
-        if (!singularConfigApplied && registry.length === 0) {
+        // 1.x back-compat. A 2.1+ copy has already merged the singular global
+        // over its own tag config and says so; anything else gets the guarded
+        // manager-side fallback, once, on the first registration (which for a
+        // single-plugin page is exactly the 1.x behaviour: window > data-* >
+        // defaults).
+        if (raw.__singularApplied) {
             singularConfigApplied = true;
-            safe(function () {
-                var w = window.JellyfinRefreshKitConfig;
-                if (w && typeof w === 'object') {
-                    for (var k in w) { if (Object.prototype.hasOwnProperty.call(w, k)) merged[k] = w[k]; }
-                }
-            });
+        } else if (!singularConfigApplied && registry.length === 0) {
+            singularConfigApplied = true;
+            applySingularWindowConfigFallback(merged);
         }
 
-        // Keyed window config: matched by the name the instance would resolve
-        // to WITHOUT it (data-name, else derived from versionUrl). The key IS
-        // the name, so a keyed entry cannot rename its instance.
-        var provisionalName = (typeof merged.name === 'string' && merged.name.trim()) ||
-            deriveName(typeof merged.versionUrl === 'string' ? merged.versionUrl : '');
-        if (provisionalName) {
-            safe(function () {
-                var all = window.JellyfinRefreshKitConfigs;
-                var entry = (all && typeof all === 'object') ? all[provisionalName] : null;
-                if (entry && typeof entry === 'object') {
-                    for (var k in entry) {
-                        if (Object.prototype.hasOwnProperty.call(entry, k) && k !== 'name') merged[k] = entry[k];
-                    }
+        // Resolve the FINAL instance name BEFORE consulting the keyed config.
+        // Deriving a provisional name straight off the raw merge made the keyed
+        // form unreachable for exactly the tags that need it most: a tag with
+        // neither data-name nor data-version-url (the eval/JS-Injector shape)
+        // resolved to '' and skipped the lookup entirely, so its "instance-<N>"
+        // name was never addressable.
+        var provisional = normalizeConfig(merged);
+        var name = provisional.name || deriveName(provisional.versionUrl) ||
+            ('instance-' + (registry.length + 1));
+
+        // Keyed window config, looked up under the name the instance actually
+        // has. `name` is excluded — and, unlike before, the final name is NOT
+        // re-derived afterwards, so a keyed entry that supplies its own
+        // versionUrl can no longer rename the instance out from under the key
+        // it was found under (which used to break get(name) silently).
+        safe(function () {
+            var all = window.JellyfinRefreshKitConfigs;
+            var entry = (all && typeof all === 'object') ? all[name] : null;
+            if (entry && typeof entry === 'object') {
+                for (var k in entry) {
+                    if (Object.prototype.hasOwnProperty.call(entry, k) && k !== 'name') merged[k] = entry[k];
                 }
-            });
-        }
+            }
+        });
 
         var cfg = normalizeConfig(merged);
-        var name = cfg.name || deriveName(cfg.versionUrl) || ('instance-' + (registry.length + 1));
         // Stamp the RESOLVED name before the equivalence check, so a duplicate
         // tag that omitted data-name (name derived from versionUrl) still
         // compares equal to the instance it duplicates.
@@ -1710,8 +2322,15 @@
                 // plugins genuinely shipping the same adoption): silent dedupe.
                 return existing.handle;
             }
-            var base = name, n = 2;
-            while (byName[base + '#' + n]) n++;
+            // ...and compare against every collision-suffixed variant too.
+            // Checking only the base name is how a third copy of an adoption
+            // that already lost the base name became a live "#3" instance and
+            // ran the same entry chain a third time.
+            var base = name, n = 2, variant;
+            while ((variant = byName[base + '#' + n])) {
+                if (configsEquivalent(variant.cfg, cfg)) return variant.handle;
+                n++;
+            }
             name = base + '#' + n;
             safe(function () {
                 console.warn(LOG, 'instance name "' + base + '" already registered with a different ' +
@@ -1720,9 +2339,34 @@
             });
         }
 
+        // Two instances must never load the same entry files into one document.
+        // The browser serves the second copy from cache at the identical ?v=
+        // URL and RE-EXECUTES it: duplicate injectors, duplicate observers,
+        // duplicate DOM. The instance still registers (its patterns and version
+        // are useful); only the entry chain is suppressed.
+        var entriesSuppressed = false;
+        var entryOwner = null;
+        if (cfg.entryScripts.length) {
+            for (var e = 0; e < registry.length; e++) {
+                if (sameEntryList(registry[e].cfg.entryScripts, cfg.entryScripts)) {
+                    entriesSuppressed = true;
+                    entryOwner = registry[e].name;
+                    break;
+                }
+            }
+        }
+        if (entriesSuppressed) {
+            safe(function () {
+                console.warn(LOG, 'instance "' + name + '" declares the same entryScripts as already-' +
+                    'registered instance "' + entryOwner + '"; loading them twice would re-execute the ' +
+                    'same files. Registering WITHOUT the entry chain (versioning and update detection ' +
+                    'still apply).');
+            });
+        }
+
         cfg.name = name;
         var sourceVersion = String(sourceKitVersion || 'unknown');
-        var inst = createInstance(name, cfg, sourceVersion);
+        var inst = createInstance(name, cfg, sourceVersion, entriesSuppressed);
         registry.push(inst);
         byName[name] = inst;
         safe(function () {
@@ -1900,13 +2544,36 @@
         window.addEventListener('pageshow', function () { safe(onWake); }, false);
     });
 
+    // REGISTRATION CONTRACT clause 1 makes "the first copy installs
+    // window.JellyfinRefreshKit" a load-bearing invariant, so install it
+    // NON-CONFIGURABLE: writable:false alone only blocks plain assignment, and
+    // a configurable property can still be replaced wholesale by
+    // defineProperty — which is precisely what an older 1.x copy loading second
+    // does. That used to strip __registerInstance off the page while this
+    // manager's registry, timers and interceptor kept running invisibly, so
+    // every LATER copy went inert blaming a "pre-2.0 singleton" that wasn't
+    // there. Nothing legitimate needs to replace this object: a second 2.x copy
+    // never reaches this line (it registers and returns), and a 1.x copy's own
+    // defineProperty now throws into its own safe() and it keeps running.
     safe(function () {
         Object.defineProperty(window, 'JellyfinRefreshKit', {
-            value: api, writable: false, configurable: true, enumerable: true
+            value: api, writable: false, configurable: false, enumerable: true
+        });
+    });
+
+    // Belt and braces for the case the line above could not win (an unrelated
+    // plugin got there first with its own non-configurable property, or a
+    // future engine quirk): a non-enumerable backup handle that a later copy's
+    // role decision consults before concluding the page belongs to a 1.x
+    // singleton. Non-enumerable so it stays out of for-in / Object.keys sweeps
+    // over window, which some plugins do.
+    safe(function () {
+        Object.defineProperty(window, '__jellyfinRefreshKitManager', {
+            value: api, writable: false, configurable: false, enumerable: false
         });
     });
 
     // Finally: register THIS copy's own instance from its tag config, through
     // exactly the same contract path a later copy would use.
-    safe(function () { api.__registerInstance(tagConfig, KIT_VERSION); });
+    safe(function () { api.__registerInstance(ownConfig, KIT_VERSION); });
 })();
