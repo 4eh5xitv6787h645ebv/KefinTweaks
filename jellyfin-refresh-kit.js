@@ -83,7 +83,10 @@
  *     reload, and the effective reload budget is the MINIMUM reloadBudget
  *     among all registered instances — the page honours every adopter's most
  *     conservative ask. Notify-mode instances never trigger the shared
- *     reload; their callback still fires.
+ *     reload; their callback still fires. ONE NAVIGATION SPENDS ONE BUDGET
+ *     SLOT (2.1.2): the engine latches once location.reload() is called, so
+ *     instances that arm in the window before the new document commits ride
+ *     that reload instead of reserving another.
  *
  *   • RELOAD COST WITH N INSTANCES: after a reload triggered by instance A,
  *     instance B's unchanged-version assets are re-requested at their SAME
@@ -93,10 +96,18 @@
  *   • NAMES: each instance has a name — config `name` / attribute data-name.
  *     If omitted, the name is derived deterministically from versionUrl (the
  *     last directory segment of its path, e.g. "/web/KefinTweaks/version.json"
- *     → "KefinTweaks"); with no versionUrl either, it falls back to
- *     "instance-<index>". Registering the same name again with an EQUIVALENT
- *     config is a silent dedupe (you get the existing instance back);
- *     the same name with a DIFFERENT config registers as "name#2" and warns.
+ *     → "KefinTweaks"); with neither, it falls back to "instance-<N>", where N
+ *     counts ANONYMOUS adoptions only — a named adopter whose tag parses first
+ *     cannot renumber it (since 2.1.2), so the name stays addressable from
+ *     JellyfinRefreshKitConfigs. Registering the same name again with an
+ *     EQUIVALENT config is a silent dedupe (you get the existing instance
+ *     back); the same name with a DIFFERENT config registers as "name#2" and
+ *     warns. An anonymous adoption has no name to collide on, so it is deduped
+ *     by comparing its declared config against the anonymous instances already
+ *     registered — an injector that applies the same nameless payload twice
+ *     gets one instance, not two. (A tag declaring literally nothing is exempt:
+ *     several of those are indistinguishable until their own
+ *     JellyfinRefreshKitConfigs["instance-<N>"] entries are read.)
  *
  *   • WINDOW CONFIG: window.JellyfinRefreshKitConfig (the 1.x singular form) is
  *     read by EACH COPY at its own tag position, synchronously, in the same
@@ -109,7 +120,13 @@
  *     a copy therefore applies it only when it does not name somebody else —
  *     if the global's name/versionUrl disagrees with the tag's own data-name/
  *     data-version-url, the copy SKIPS it with one warning and keeps its own
- *     attributes. (No-op for the single-adopter 1.x shape.) The manager keeps
+ *     attributes. Since 2.1.2 the same holds for a global that names NOBODY
+ *     (only behavioural keys — assetPatterns/mode/onUpdateAvailable/
+ *     getVersion): it binds to the first kit tag that takes it, and a later tag
+ *     with declarations of its own skips it with one warning. A later tag that
+ *     declares nothing at all still reads it — that is the same adoption
+ *     injected twice, and the registry dedupes it.
+ *     (All of this is a no-op for the single-adopter 1.x shape.) The manager keeps
  *     the identically-guarded fallback for copies that cannot read the global
  *     themselves (pre-2.1 copies, and eval'd copies with no currentScript): it
  *     applies the singular global to the FIRST registration only.
@@ -121,8 +138,9 @@
  *     falls back to the base-name entry only when no entry exists under its
  *     own key. The keyed form is read SYNCHRONOUSLY by each tag at its own
  *     position, so it must be defined BEFORE every kit tag; an entry that
- *     names an already-registered instance is reported with one warning once
- *     the document has parsed. Priority per instance:
+ *     names an already-registered instance — or (since 2.1.2) no instance at
+ *     all — is reported with one warning once the document has parsed.
+ *     Priority per instance:
  *     keyed entry > singular > data-* > defaults.
  *
  * ---------------------------------------------------------------------------
@@ -364,8 +382,19 @@
      *           never-played media element no longer blocks (and a frozen one
      *           cannot starve the reload forever); per-instance
      *           blockReason/idle use the window the shared engine enforces.
+     *   2.1.2 — interception and multi-adopter correctness: `src`/`href`
+     *           assigned a URL or boxed String object is versioned instead of
+     *           silently bypassing layer 2 (both the accessor and
+     *           setAttribute); ONE navigation reserves ONE reload-budget slot,
+     *           however many instances arm during unload; the "instance-<N>"
+     *           fallback name is numbered across ANONYMOUS adoptions only and
+     *           an anonymous adoption registered twice dedupes; a keyed config
+     *           key that matches no instance is reported instead of ignored;
+     *           and a singular window config that identifies nobody binds to
+     *           the first tag that takes it rather than leaking into every
+     *           later adopter.
      */
-    var KIT_VERSION = '2.1.1';
+    var KIT_VERSION = '2.1.2';
 
     /**
      * @type {number} Registration-contract revision this copy speaks (see the
@@ -642,6 +671,47 @@
     var tagConfig = safe(readScriptTagConfig, {}) || {};
 
     /**
+     * Property used to record that a singular window config object has already
+     * been claimed by a kit tag. Non-enumerable, so it never reaches a merged
+     * config through the `for (k in w)` copy below (or through JSON, or through
+     * an adopter's own inspection of the object they wrote).
+     * @type {string}
+     */
+    var SINGULAR_CLAIM_KEY = '__jellyfinRefreshKitBoundToTag';
+
+    /**
+     * Has this singular window config object already been claimed by an earlier
+     * kit tag? If not, CLAIM it for this one.
+     *
+     * Only consulted for a global that identifies no adoption (see the big
+     * block comment below) — a global that names itself is still matched by
+     * name/versionUrl, exactly as in 2.1.1.
+     *
+     * @param {Object} w The live window.JellyfinRefreshKitConfig object.
+     * @returns {boolean} True when an earlier tag already took it.
+     */
+    function singularGlobalIsSpokenFor(w) {
+        var claimed = safe(function () { return w[SINGULAR_CLAIM_KEY] === true; }, false) === true;
+        if (claimed) return true;
+        var marked = safe(function () {
+            Object.defineProperty(w, SINGULAR_CLAIM_KEY, {
+                value: true,
+                enumerable: false,
+                configurable: true,
+                writable: true
+            });
+            return w[SINGULAR_CLAIM_KEY] === true;
+        }, false) === true;
+        if (marked) return false;
+        // Unmarkable (frozen / exotic). Fall back to the coarse question: has a
+        // kit copy already run on this page? If so this cannot be the first tag,
+        // so decline rather than risk the leak.
+        return safe(function () {
+            return !!(window.JellyfinRefreshKit || window.__jellyfinRefreshKitManager);
+        }, false) === true;
+    }
+
+    /**
      * The 1.x singular window config belongs to the TAG it was authored next
      * to, not to "whichever instance registers first". README §(a) documents
      * writing `window.JellyfinRefreshKitConfig = {...}` in an inline script
@@ -667,12 +737,43 @@
      * tag on the page never disagrees with it), so the semantics that have
      * always worked are unchanged.
      *
+     * SECOND HALF OF THE SAME GUARD (2.1.2). The "disagrees" test above needs
+     * the identifier on BOTH sides, so a global carrying only behavioural keys
+     * — `assetPatterns`, `mode`, `onUpdateAvailable`, `getVersion`, the very
+     * things README §(a) says the config object is the only way to pass — names
+     * nobody and therefore never disagreed with anything. It was merged
+     * wholesale into every later kit tag in the document, which is exactly the
+     * pre-2.1.1 leak with the endpoint left out: the later adopter stops
+     * versioning its own folder (A's assetPatterns REPLACE B's) and, with
+     * `mode: 'notify'`, never auto-reloads again. So a global that identifies
+     * nobody binds to the FIRST kit tag that consumes it, and a later tag THAT
+     * DECLARES CONFIG OF ITS OWN declines it with one warning.
+     *
+     * Two deliberate narrowings:
+     *
+     *  • "First" is tracked on the global OBJECT itself (a non-enumerable
+     *    marker), not by a page-level "has anything registered yet" flag,
+     *    because the README-blessed multi-adopter shape is several adopters
+     *    each ASSIGNING their own singular global immediately above their own
+     *    tag: those are distinct objects, so each still lands on its author's
+     *    tag. Only one object surviving to a second tag — the leak — is
+     *    refused. If the object cannot be marked (frozen, exotic proxy) the
+     *    copy falls back to the coarser question "did another kit copy already
+     *    run on this page?", which is right for the leak and merely
+     *    conservative for the other shape.
+     *  • A later tag that declares NOTHING (no data-* at all — the eval'd /
+     *    JS-Injector shape, where the global is the whole configuration) still
+     *    reads it. That is not a leak: it is the same adoption injected twice,
+     *    and the registry's anonymous-equivalence dedupe collapses it into the
+     *    instance that already exists. Refusing it there would trade one
+     *    duplicate instance for one permanently inert instance.
+     *
      * One residual ambiguity survives and cannot be resolved from a single
      * global: if a page mixes a pre-2.1 copy with a 2.1+ copy and BOTH rely on
      * the singular form WITHOUT naming themselves, the 2.1+ copy reads
-     * whichever value of the global is live at its own tag. Multi-adopter
-     * pages should use the keyed form (window.JellyfinRefreshKitConfigs),
-     * which is unambiguous by construction.
+     * whichever value of the global is live at its own tag (a pre-2.1 copy
+     * leaves no marker). Multi-adopter pages should use the keyed form
+     * (window.JellyfinRefreshKitConfigs), which is unambiguous by construction.
      *
      * `__singularApplied` tells the manager this copy already SETTLED the
      * singular global for its own tag — whether by merging it or by declining
@@ -698,6 +799,24 @@
             var tUrl = typeof out.versionUrl === 'string' ? out.versionUrl : '';
             var disagrees = (!!wName && !!tName && wName !== tName) ||
                 (!!wUrl && !!tUrl && wUrl !== tUrl);
+            // Identifies nobody: no name, no versionUrl. See the block comment.
+            var anonymousGlobal = !wName && !wUrl;
+            // Claim it for this tag (side effect) and learn whether an earlier
+            // tag got there first. Claimed unconditionally for an anonymous
+            // global, so a tag that declares nothing cannot leave it open for a
+            // later data-* tag to absorb.
+            var takenByEarlierTag = anonymousGlobal && singularGlobalIsSpokenFor(w);
+            // Does this tag declare anything of its own? A tag that does is a
+            // distinct adoption, and merging somebody else's behavioural keys
+            // over it is the leak. A tag that declares NOTHING is either the
+            // same adoption re-injected (the registry dedupes it) or an empty
+            // adoption that would be inert either way — so it still reads the
+            // global, exactly as a single-adopter page always has.
+            var tagDeclaresOwn = false;
+            for (k in out) {
+                if (Object.prototype.hasOwnProperty.call(out, k)) { tagDeclaresOwn = true; break; }
+            }
+            var alreadyBound = takenByEarlierTag && tagDeclaresOwn;
             if (disagrees) {
                 safe(function () {
                     console.warn(LOG, 'window.JellyfinRefreshKitConfig names ' +
@@ -707,6 +826,18 @@
                         'the kit never clears it, so it is still live at every later kit tag. Use ' +
                         'window.JellyfinRefreshKitConfigs = { "<instance name>": {...} } to configure a ' +
                         'specific instance.');
+                });
+            } else if (alreadyBound) {
+                safe(function () {
+                    console.warn(LOG, 'window.JellyfinRefreshKitConfig declares neither "name" nor ' +
+                        '"versionUrl", so it identifies no adoption, and an earlier kit tag has ' +
+                        'already taken it — NOT applying it to this instance' +
+                        (tName ? ' ("' + tName + '")' : tUrl ? ' (' + tUrl + ')' : '') + '. The ' +
+                        'singular global is a 1.x, one-adoption-per-page form and the kit never ' +
+                        'clears it, so it stays live at every later kit tag; applying it again would ' +
+                        "silently replace this tag's own assetPatterns/mode/callback with somebody " +
+                        'else\'s. Use window.JellyfinRefreshKitConfigs = { "<instance name>": {...} } ' +
+                        'to configure a specific instance.');
                 });
             } else {
                 for (k in w) { if (Object.prototype.hasOwnProperty.call(w, k)) out[k] = w[k]; }
@@ -841,6 +972,19 @@
      * @param {RefreshKitConfig} b
      * @returns {boolean}
      */
+    /**
+     * Does this normalized config say anything that could identify the adoption
+     * it belongs to? Used only for the anonymous dedupe scan: cadence and mode
+     * are excluded on purpose, since they describe how an adoption behaves
+     * rather than which one it is.
+     * @param {RefreshKitConfig} cfg
+     * @returns {boolean}
+     */
+    function declaresIdentity(cfg) {
+        return !!(cfg.versionUrl || cfg.getVersion || cfg.onUpdateAvailable || cfg.bootVersion ||
+            cfg.entryScripts.length || cfg.assetPatterns.length);
+    }
+
     function configsEquivalent(a, b) {
         var scalar = ['versionUrl', 'versionJsonField', 'bootVersion', 'pollSeconds', 'idleSeconds',
             'entryTimeoutMs', 'mode', 'reloadBudget', 'getVersion', 'onUpdateAvailable'];
@@ -868,6 +1012,16 @@
     var registry = [];
     /** @type {Object<string, Object>} name → instance. */
     var byName = Object.create(null);
+    /**
+     * How many ANONYMOUS adoptions (neither `name` nor a derivable `versionUrl`)
+     * have registered. The "instance-<N>" fallback is numbered off this counter
+     * and NOT off registry.length, so an unrelated named adopter whose kit tag
+     * happens to parse first cannot renumber somebody else's instance — which
+     * would silently void the one thing that names it,
+     * `JellyfinRefreshKitConfigs['instance-1']`.
+     * @type {number}
+     */
+    var anonymousCount = 0;
     /** @type {number} Timestamp of the last user interaction (page-level). */
     var lastInteractionAt = Date.now();
     /** @type {number|null} setTimeout handle for the blocked-reload retry. */
@@ -913,6 +1067,18 @@
      * @type {boolean}
      */
     var warnedBudgetRefusal = false;
+    /**
+     * ONE NAVIGATION, ONE RESERVATION. `location.reload()` does not stop the
+     * page: script keeps running until the new document commits, which is a
+     * full network round trip away. Without this latch a second instance whose
+     * version fetch resolves in that window arms, re-enters tryReload(), passes
+     * every gate again and spends a SECOND slot of the shared reload budget on
+     * the very same navigation — so a two-adopter page burns 2 of the default 3
+     * per reload and defers the next genuine update for a whole budget window
+     * for no reason. Mirrors client-refresh.js's `reloadCommitted`.
+     * @type {boolean}
+     */
+    var reloadCommitted = false;
     /** @type {boolean} One-shot latch: warn about overlapping assetPatterns once. */
     var warnedOverlap = false;
     /** @type {boolean} True once the single createElement wrapper is installed. */
@@ -1028,6 +1194,35 @@
      * @param {Element} el
      * @param {'src'|'href'} prop
      */
+    /**
+     * Normalize a value assigned to `src`/`href` into the string the browser
+     * would resolve, WITHOUT changing what any other value is.
+     *
+     * Only two wrappers qualify: a `URL` instance and a boxed `String`. Both are
+     * spec-guaranteed to stringify to exactly the URL the native setter would
+     * use, so rewriting them is behaviour-preserving. Everything else is
+     * returned untouched on purpose:
+     *
+     *   • A `TrustedScriptURL` (or any Trusted Types object) MUST reach the
+     *     native setter as the object it is. Under
+     *     `require-trusted-types-for 'script'` a string re-assignment throws a
+     *     TypeError at `native.set`, which is outside this function's safe()
+     *     wrapper — i.e. blanket coercion would break the page it was meant to
+     *     help.
+     *   • An arbitrary object's `toString` may be user code with side effects.
+     *     Calling it here would run it twice (once for us, once for the
+     *     browser), which is not a rewrite, it is a behaviour change.
+     *
+     * @param {*} value
+     * @returns {*} The string form for URL/String wrappers, otherwise `value`.
+     */
+    function normalizeUrlValue(value) {
+        if (typeof value === 'string') return value;
+        if (typeof URL === 'function' && value instanceof URL) return String(value);
+        if (value instanceof String) return String(value);
+        return value;
+    }
+
     function interceptUrlProperty(el, prop) {
         var proto = Object.getPrototypeOf(el);
         var native = Object.getOwnPropertyDescriptor(proto, prop);
@@ -1041,7 +1236,21 @@
             get: function () { return native.get.call(this); },
             set: function (value) {
                 var rewritten = safe(function () {
-                    return typeof value === 'string' ? versionUrlForPage(value) : value;
+                    // `s.src = new URL('scripts/a.js', base)` is an ordinary
+                    // modern idiom, and the browser ToStrings it on the way in
+                    // — so a raw `typeof value === 'string'` gate let the whole
+                    // of layer 2 silently switch itself off for any collection
+                    // that builds URLs that way. Normalize the two wrappers the
+                    // spec guarantees stringify to the URL the browser will use
+                    // (URL and boxed String), and NOTHING else: a
+                    // TrustedScriptURL must reach the native setter as the
+                    // trusted object it is (coercing it to a string under a
+                    // `require-trusted-types-for 'script'` CSP throws at
+                    // native.set, outside this safe() wrapper), and an arbitrary
+                    // object's toString may have side effects that are not ours
+                    // to trigger twice.
+                    var v = normalizeUrlValue(value);
+                    return typeof v === 'string' ? versionUrlForPage(v) : v;
                 }, value);
                 native.set.call(this, rewritten);
             }
@@ -1062,8 +1271,15 @@
             enumerable: false,
             writable: true,
             value: function (name, value) {
-                if (typeof name === 'string' && name.toLowerCase() === prop && typeof value === 'string') {
-                    value = safe(function () { return versionUrlForPage(value); }, value);
+                if (typeof name === 'string' && name.toLowerCase() === prop) {
+                    // Same normalization as the property accessor — see
+                    // normalizeUrlValue: `setAttribute('src', new URL(...))`
+                    // is as common as the property form and must not be a
+                    // silent hole in layer 2.
+                    var v = safe(function () { return normalizeUrlValue(value); }, value);
+                    if (typeof v === 'string') {
+                        value = safe(function () { return versionUrlForPage(v); }, v);
+                    }
                 }
                 return nativeSetAttribute.call(this, name, value);
             }
@@ -1092,6 +1308,11 @@
      * Note we intentionally do NOT patch createElementNS, innerHTML, or
      * document.write. Those are rarer, much more invasive to intercept, and the
      * cost of missing them is only that a given asset stays unversioned.
+     *
+     * The VALUE assigned is handled by normalizeUrlValue: strings and the two
+     * wrappers that provably stringify to the same URL (URL, boxed String) are
+     * versioned; a TrustedScriptURL or any other object is passed through
+     * untouched, which is a deliberate, documented limit.
      */
     function installCreateElementHook() {
         var nativeCreateElement = document.createElement;
@@ -1618,6 +1839,29 @@
      * unchanged) versions.
      */
     function tryReload() {
+        // The navigation is already committed; this document is on its way out.
+        // Anything that arms between here and unload is served by the reload
+        // that is already in flight, so it must not reserve a second slot of
+        // the shared budget (nor log a second "reloading to pick up" line).
+        if (reloadCommitted) {
+            // It IS going to be picked up, though — so record its transition
+            // with the same evidence value the committing instances got, or the
+            // flap guard would have no memory of a reload that did happen.
+            var late = pendingInstances();
+            for (var l = 0; l < late.length; l++) {
+                safe(function (p) {
+                    return function () {
+                        console.debug(LOG, 'reload already committed; ' + p.name + ' ' +
+                            p.getBaselineVersion() + ' → ' + p.getLatestVersion() +
+                            ' rides the navigation already in flight.');
+                        rememberFlip(p.name, p.getBaselineVersion(), p.getLatestVersion());
+                    };
+                }(late[l]));
+                late[l].updatePending = false;
+            }
+            return;
+        }
+
         var pending = pendingInstances();
         if (pending.length === 0) return;
 
@@ -1709,8 +1953,15 @@
             safe(function (p) {
                 return function () { rememberFlip(p.name, p.getBaselineVersion(), p.getLatestVersion()); };
             }(pending[j]));
-            pending[j].updatePending = false;
         }
+        // Commit BEFORE the reload call and disarm EVERY registered instance,
+        // not just the ones pending at this instant: the reload that is now in
+        // flight serves all of them, and an instance that arms during the unload
+        // window would otherwise re-enter tryReload() (the latch above is the
+        // second half of the same guard).
+        reloadCommitted = true;
+        for (var r = 0; r < registry.length; r++) registry[r].updatePending = false;
+        clearRetry();
         safe(function () { location.reload(); });
     }
 
@@ -2744,8 +2995,45 @@
         // `declared` is the adoption exactly as the TAG declared it (data-* plus
         // the singular global), normalized but with no keyed entry merged in.
         var declared = normalizeConfig(merged);
-        var baseName = declared.name || deriveName(declared.versionUrl) ||
-            ('instance-' + (registry.length + 1));
+        var declaredName = declared.name || deriveName(declared.versionUrl);
+
+        // ANONYMOUS ADOPTIONS (no data-name, no versionUrl to derive one from —
+        // the eval'd / JS-Injector shape configured entirely through the window
+        // config). Two things have to hold for them that a plain
+        // "instance-<registry.length + 1>" cannot deliver:
+        //
+        //  • A double registration of the SAME anonymous adoption must dedupe.
+        //    An ordinal name is a function of arrival order, not of the
+        //    adoption, so the byName lookup below always missed and the
+        //    equivalence machinery was never reached: an injector applying the
+        //    same payload twice got two live instances polling the same
+        //    endpoint, firing onUpdateAvailable twice per release and warning
+        //    about "overlapping assetPatterns" against itself. So compare
+        //    against the anonymous instances already registered FIRST, using
+        //    the same declared-config equivalence the named path uses.
+        //  • The number must not move when an unrelated NAMED adopter registers
+        //    first. It is the only handle such an adoption has
+        //    (JellyfinRefreshKitConfigs['instance-1']), and a name that depends
+        //    on somebody else's tag order is not a handle at all.
+        //
+        // The scan is skipped for an adoption that declares NOTHING identifying
+        // at all (no version source, no patterns, no entries, no callback —
+        // only defaults). Two of those are indistinguishable by construction,
+        // and collapsing them would break the supported shape where several
+        // bare tags are each configured by their own
+        // JellyfinRefreshKitConfigs['instance-<N>'] entry, which is read only
+        // AFTER the name is settled. Two such instances are inert until their
+        // keyed entries arrive, so leaving them apart costs nothing.
+        var anonymous = !declaredName;
+        if (anonymous && declaresIdentity(declared)) {
+            for (var q = 0; q < registry.length; q++) {
+                if (registry[q].anonymous && configsEquivalent(registry[q].declaredCfg, declared)) {
+                    return registry[q].handle;
+                }
+            }
+        }
+
+        var baseName = declaredName || ('instance-' + (anonymousCount + 1));
         var name = baseName;
 
         // DEDUPE / COLLISION FIRST, KEYED CONFIG SECOND (2.1.1). Two things
@@ -2856,8 +3144,11 @@
         inst.declaredCfg = declared;
         /** @type {string|null} Which JellyfinRefreshKitConfigs key configured this instance. */
         inst.keyedConfigKey = keyedConfigKey;
+        /** @type {boolean} Registered without a declared/derivable name (see above). */
+        inst.anonymous = anonymous;
         registry.push(inst);
         byName[name] = inst;
+        if (anonymous) anonymousCount++;
         safe(function () {
             console.log(LOG, 'instance registered: "' + name + '" (kit ' + sourceVersion +
                 ', manager ' + KIT_VERSION + ', ' + registry.length + ' total)' +
@@ -2886,6 +3177,14 @@
      * So once the document has finished parsing, compare the keys against the
      * instances that registered: a key naming a live instance that did NOT
      * consume it can only mean the entry was defined after that instance's tag.
+     *
+     * A key matching NO instance at all is reported too (2.1.2). It used to be
+     * skipped silently, which made the audit blind to exactly the misconfigured
+     * shape it exists for: a typo'd key, or an `instance-<N>` key whose number
+     * no longer names the anonymous adoption the author meant. The instance the
+     * entry was written for then runs on pure defaults — for a `versionUrl`-less
+     * adoption, completely inert — behind no signal at all. The warning lists
+     * the live instance names, because the fix is always "use one of these".
      */
     function auditKeyedConfigs() {
         safe(function () {
@@ -2895,7 +3194,30 @@
                 if (!Object.prototype.hasOwnProperty.call(all, key)) continue;
                 if (warnedLateKeys[key]) continue;
                 var inst = byName[key];
-                if (!inst || inst.keyedConfigKey === key) continue;
+                if (!inst) {
+                    // Not just "no instance under that name": no instance
+                    // consumed the key under any name either (a "#2" instance
+                    // may have fallen back to the base-name entry).
+                    var consumed = false;
+                    for (var c = 0; c < registry.length; c++) {
+                        if (registry[c].keyedConfigKey === key) { consumed = true; break; }
+                    }
+                    if (consumed) continue;
+                    warnedLateKeys[key] = true;
+                    safe(function (k) {
+                        return function () {
+                            console.warn(LOG, 'window.JellyfinRefreshKitConfigs["' + k + '"] matched NO ' +
+                                'registered instance and was never applied. Registered instance names: ' +
+                                (registry.length
+                                    ? registry.map(function (r) { return '"' + r.name + '"'; }).join(', ')
+                                    : '(none)') + '. Keys are matched against an instance\'s FINAL name — ' +
+                                'data-name, else the versionUrl\'s parent folder, else "instance-<N>" ' +
+                                'numbered across anonymous adoptions only, plus any "#2" collision suffix.');
+                        };
+                    }(key));
+                    continue;
+                }
+                if (inst.keyedConfigKey === key) continue;
                 warnedLateKeys[key] = true;
                 safe(function (k) {
                     return function () {
