@@ -104,16 +104,25 @@
  *     authored next to, not "whichever instance happened to register first".
  *     A single-plugin page behaves exactly as it did in 1.x. On a page where
  *     several adopters each write the singular global before their own tag,
- *     each one lands on its own instance. The manager keeps a guarded fallback
- *     for copies that cannot read it themselves (pre-2.1 copies, and eval'd
- *     copies with no currentScript): it applies the singular global to the
- *     FIRST registration only, and SKIPS it with one warning when the global's
- *     name/versionUrl disagrees with the registering tag's own.
+ *     each one lands on its own instance. The global is NEVER cleared by the
+ *     kit, so it is still live at every later tag in the document; since 2.1.1
+ *     a copy therefore applies it only when it does not name somebody else —
+ *     if the global's name/versionUrl disagrees with the tag's own data-name/
+ *     data-version-url, the copy SKIPS it with one warning and keeps its own
+ *     attributes. (No-op for the single-adopter 1.x shape.) The manager keeps
+ *     the identically-guarded fallback for copies that cannot read the global
+ *     themselves (pre-2.1 copies, and eval'd copies with no currentScript): it
+ *     applies the singular global to the FIRST registration only.
  *     For targeted config use the keyed form: window.JellyfinRefreshKitConfigs
  *     = { "KefinTweaks": {...}, "DemoPack": {...} } — each entry merges over
  *     (and wins against) the matching instance's tag attributes, and is looked
- *     up under the instance's FINAL resolved name (including an
- *     "instance-<N>" fallback name). Priority per instance:
+ *     up under the instance's FINAL resolved name (including the "#2"
+ *     collision suffix and an "instance-<N>" fallback name); a "#N" instance
+ *     falls back to the base-name entry only when no entry exists under its
+ *     own key. The keyed form is read SYNCHRONOUSLY by each tag at its own
+ *     position, so it must be defined BEFORE every kit tag; an entry that
+ *     names an already-registered instance is reported with one warning once
+ *     the document has parsed. Priority per instance:
  *     keyed entry > singular > data-* > defaults.
  *
  * ---------------------------------------------------------------------------
@@ -152,9 +161,11 @@
  *         pollSeconds, idleSeconds, assetPatterns, entryScripts,
  *         entryTimeoutMs, mode, onUpdateAvailable, reloadBudget, bootVersion —
  *         plus the private marker `__singularApplied`, set by a 2.1+ copy that
- *         already merged window.JellyfinRefreshKitConfig over its own tag
- *         config, so the manager does not apply it a second time somewhere
- *         else; an older manager simply ignores the unknown key). The MANAGER
+ *         already SETTLED window.JellyfinRefreshKitConfig for its own tag —
+ *         either merging it over that tag's config or (2.1.1+) declining it
+ *         because it named a different adoption — so the manager does not
+ *         apply it a second time somewhere else; an older manager simply
+ *         ignores the unknown key). The MANAGER
  *         normalizes and clamps with its own rules and MUST ignore unknown
  *         keys — that is what lets an older manager accept a config written
  *         for a newer kit. The manager also applies the window config layers
@@ -299,6 +310,18 @@
  *   sessionStorage, so it is per-tab and survives the reloads it is policing).
  *   The kit logs one line and keeps versioning URLs; it cannot make an unstable
  *   endpoint stable — serve one identity per release across all nodes.
+ * • THE MEDIA GATE is deliberately coarse: any <video>/<audio> on the page that
+ *   represents a real session blocks the auto-reload, not just Jellyfin's own
+ *   player. Since 2.1.1 "a real session" means playing, or paused with a
+ *   playback position / a played range / an in-progress seek — a decorative
+ *   element a plugin parks in the DOM with a src and preload set is NOT a
+ *   session and no longer blocks (before, it blocked forever and silently
+ *   switched layer 3 off for that page). A media element that IS a session but
+ *   then freezes — paused and abandoned, or stalled mid-buffer — still blocks,
+ *   but only for ~10 minutes of zero playback progress anywhere on the page
+ *   (the same span the retry ladder covers); after that the kit logs one line
+ *   and re-tests with the media probe suppressed. Every other gate (dialog,
+ *   editor, route, fullscreen, visibility, idle) still applies.
  * • A CDN's own "@latest" resolution TTL is invisible to JavaScript. jsDelivr
  *   caches the @latest → tag mapping for up to 24h; no amount of ?v= changes
  *   that, because the STALE FILE IS THE CORRECT RESPONSE for that URL. Pin a
@@ -329,8 +352,20 @@
      *           poison the baseline; the singular window config follows its own
      *           tag; the manager global can no longer be clobbered; classic
      *           mode 'off' still resolves one version so URLs stay versioned.
+     *   2.1.1 — multi-adopter and liveness fixes: the singular window config is
+     *           no longer absorbed by a LATER adopter's tag; the keyed config is
+     *           looked up under the FINAL name (including "#N") and can no
+     *           longer manufacture a dedupe; an update the server WITHDRAWS
+     *           disarms instead of reloading for nothing; every version check
+     *           has a 10s ceiling and the poll loop re-arms ahead of the
+     *           request, so a hung endpoint cannot stop polling; the
+     *           confirmation fetch is capped at one per poll cycle; the two
+     *           per-interaction timers are tracked and superseded; a parked,
+     *           never-played media element no longer blocks (and a frozen one
+     *           cannot starve the reload forever); per-instance
+     *           blockReason/idle use the window the shared engine enforces.
      */
-    var KIT_VERSION = '2.1.0';
+    var KIT_VERSION = '2.1.1';
 
     /**
      * @type {number} Registration-contract revision this copy speaks (see the
@@ -392,6 +427,17 @@
     var MAX_BLOCKED_RETRIES = 600;
 
     /**
+     * How long a <video>/<audio> element may hold the reload gate with ZERO
+     * playback progress before the kit stops treating it as a live session.
+     * Deliberately the same ~10 minutes the 1Hz retry ladder covers: past that
+     * the element is not a session anyone is having, it is a decoration (or a
+     * permanently stalled load) that would otherwise switch layer 3 off for the
+     * life of the page. Every other gate still applies after the escape.
+     * @type {number}
+     */
+    var MEDIA_STARVATION_MS = MAX_BLOCKED_RETRIES * RETRY_MS;
+
+    /**
      * Delay before the confirmation fetch that promotes a freshly-sighted
      * candidate version into a real update. A candidate must be seen TWICE in
      * a row (with no sighting of the baseline in between) before it can arm a
@@ -402,6 +448,18 @@
      * @type {number}
      */
     var VERSION_CONFIRM_MS = 1500;
+
+    /**
+     * Hard ceiling on ONE version check (fetch or a caller's getVersion()).
+     * fetch() has no timeout of its own: a proxy that accepts the connection and
+     * never answers leaves the promise permanently unsettled, and every re-arm
+     * of the poll loop used to hang off that promise — so one stuck request
+     * killed update detection for the life of the tab, silently, with
+     * state() reporting only `polling: false`. The reference sets the same
+     * 10s ceiling on every state poll (client-refresh.js STATE_TIMEOUT_MS).
+     * @type {number}
+     */
+    var VERSION_FETCH_TIMEOUT_MS = 10000;
 
     /**
      * Bootstrap mode only: how long to wait for the FIRST version fetch before
@@ -447,6 +505,46 @@
         var n = typeof value === 'string' ? Number(value) : value;
         if (typeof n !== 'number' || !isFinite(n)) return fallback;
         return Math.min(max, Math.max(min, n));
+    }
+
+    /**
+     * Guarantee that a promise SETTLES. Whatever the wrapped work does — a
+     * fetch against a proxy that never answers, a caller's getVersion() that
+     * awaits something dead — the returned promise rejects after `ms` at the
+     * latest, so nothing downstream can be parked forever waiting on it.
+     *
+     * `onTimeout` is the optional teardown for the abandoned work (aborting the
+     * request, so the connection is freed rather than leaked); it runs at most
+     * once and its failure is swallowed.
+     *
+     * @template T
+     * @param {Promise<T>} promise
+     * @param {number} ms
+     * @param {string} label Used in the timeout Error's message.
+     * @param {() => void} [onTimeout]
+     * @returns {Promise<T>}
+     */
+    function withTimeout(promise, ms, label, onTimeout) {
+        return new Promise(function (resolve, reject) {
+            var settled = false;
+            var timer = setTimeout(function () {
+                if (settled) return;
+                settled = true;
+                if (onTimeout) safe(onTimeout);
+                reject(new Error(label + ' timed out after ' + ms + 'ms'));
+            }, ms);
+            promise.then(function (value) {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(value);
+            }, function (err) {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(err);
+            });
+        });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -553,19 +651,35 @@
      * currentScript, and merges it over its own data-* before registering.
      *
      * On a single-adopter page this is byte-identical to 1.x (window wins over
-     * data-*, both win over defaults) — deliberately unguarded here, because
-     * narrowing it would change 1.x semantics for the one shape that has always
-     * worked. On a multi-adopter page it is the only reading that attributes
-     * each config to its author. One residual ambiguity survives and cannot be
-     * resolved from a single global: if a page mixes a pre-2.1 copy with a 2.1+
-     * copy and BOTH rely on the singular form, the 2.1+ copy reads whichever
-     * value of the global is live at its own tag. Multi-adopter pages should
-     * use the keyed form (window.JellyfinRefreshKitConfigs), which is
-     * unambiguous by construction. `__singularApplied`
-     * tells the manager we already consumed the global so its own fallback
-     * (which serves pre-2.1 and eval'd copies) does not re-apply it somewhere
-     * else; an older manager simply ignores the unknown key, which leaves the
-     * pre-2.1 behaviour exactly as it was.
+     * data-*, both win over defaults). On a multi-adopter page it is the only
+     * reading that attributes each config to its author.
+     *
+     * GUARDED since 2.1.1, with exactly the check the manager-side fallback
+     * (applySingularWindowConfigFallback) has always applied: the singular
+     * global NAMES a specific adoption through `name` / `versionUrl`, and the
+     * kit never clears it, so it stays live for every later tag in the
+     * document. An adopter that writes it before its own tag and a LATER
+     * adopter whose tag is pure data-* would otherwise have the first
+     * adopter's whole config — endpoint, patterns, mode, callback — merged
+     * silently over the second one's attributes. So: when the global names a
+     * different adoption than this tag does, skip it with ONE warning. It is a
+     * no-op for the single-adopter 1.x shape (a global authored for the only
+     * tag on the page never disagrees with it), so the semantics that have
+     * always worked are unchanged.
+     *
+     * One residual ambiguity survives and cannot be resolved from a single
+     * global: if a page mixes a pre-2.1 copy with a 2.1+ copy and BOTH rely on
+     * the singular form WITHOUT naming themselves, the 2.1+ copy reads
+     * whichever value of the global is live at its own tag. Multi-adopter
+     * pages should use the keyed form (window.JellyfinRefreshKitConfigs),
+     * which is unambiguous by construction.
+     *
+     * `__singularApplied` tells the manager this copy already SETTLED the
+     * singular global for its own tag — whether by merging it or by declining
+     * it — so the manager's fallback (which serves pre-2.1 and eval'd copies)
+     * does not apply it a second time somewhere else; an older manager simply
+     * ignores the unknown key, which leaves the pre-2.1 behaviour exactly as
+     * it was.
      */
     var ownConfig = (function () {
         var out = {};
@@ -578,7 +692,27 @@
             return (g && typeof g === 'object') ? g : null;
         }, null);
         if (w) {
-            for (k in w) { if (Object.prototype.hasOwnProperty.call(w, k)) out[k] = w[k]; }
+            var wName = typeof w.name === 'string' ? w.name.trim() : '';
+            var wUrl = typeof w.versionUrl === 'string' ? w.versionUrl : '';
+            var tName = typeof out.name === 'string' ? out.name.trim() : '';
+            var tUrl = typeof out.versionUrl === 'string' ? out.versionUrl : '';
+            var disagrees = (!!wName && !!tName && wName !== tName) ||
+                (!!wUrl && !!tUrl && wUrl !== tUrl);
+            if (disagrees) {
+                safe(function () {
+                    console.warn(LOG, 'window.JellyfinRefreshKitConfig names ' +
+                        (wName ? '"' + wName + '"' : wUrl) + ', which is not the adoption this tag ' +
+                        'declares (' + (tName ? '"' + tName + '"' : tUrl) + ') — NOT applying it to ' +
+                        'this instance. The singular global is a 1.x, one-adoption-per-page form and ' +
+                        'the kit never clears it, so it is still live at every later kit tag. Use ' +
+                        'window.JellyfinRefreshKitConfigs = { "<instance name>": {...} } to configure a ' +
+                        'specific instance.');
+                });
+            } else {
+                for (k in w) { if (Object.prototype.hasOwnProperty.call(w, k)) out[k] = w[k]; }
+            }
+            // Either way this copy has SETTLED the singular global for its own
+            // tag; the manager must not re-apply it on this registration.
             out.__singularApplied = true;
         }
         return out;
@@ -738,8 +872,37 @@
     var lastInteractionAt = Date.now();
     /** @type {number|null} setTimeout handle for the blocked-reload retry. */
     var retryTimer = null;
+    /**
+     * The two timers a discrete interaction arms (a task-0 hop so the host's own
+     * handler runs first, then a wait for the remaining idle window). TRACKED
+     * since 2.1.1: untracked, one pair leaked per discrete event — typing a
+     * 40-character query queued 160 orphaned timers, each of which ran two
+     * document-wide querySelectorAll safety probes and burned a tick of the
+     * blocked-retry allowance, and none of which the hidden-tab suspend path
+     * could cancel (breaking "a hidden tab holds zero timers"). Now the latest
+     * interaction supersedes the previous one, exactly as the reference does
+     * with its single `decision` timer.
+     * @type {number|null}
+     */
+    var settleHopTimer = null;
+    /** @type {number|null} See settleHopTimer. */
+    var settleTimer = null;
     /** @type {number} Consecutive blocked retries, to stop an unbounded 1Hz loop. */
     var blockedRetries = 0;
+    /**
+     * When the current zero-progress 'media_element' block started, or null when
+     * there is no such streak. Measured in WALL TIME rather than counted in
+     * retry ticks on purpose: the 1Hz ladder is capped and can retire long
+     * before a stuck element does, after which only polls and interactions
+     * re-probe — a tick count would then stall short of the threshold forever
+     * and the escape would never fire.
+     * @type {number|null}
+     */
+    var mediaBlockSince = null;
+    /** @type {string|null} Progress fingerprint the streak above is measured against. */
+    var mediaBlockSignature = null;
+    /** @type {boolean} One-shot latch for the parked-media starvation-escape log. */
+    var warnedMediaStarvation = false;
     /** @type {string|null} Last recorded reason a reload was refused (diagnostics). */
     var lastBlockReason = null;
     /**
@@ -969,8 +1132,19 @@
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Does this media element represent a real session we must not destroy?
-     * A paused-but-loaded video still holds a playback position and a queue.
+     * Does this media element represent a real SESSION we must not destroy?
+     *
+     * Playing always counts. A paused element counts only with evidence that a
+     * session actually happened: a playback position, a played range, or an
+     * in-progress seek. Before 2.1.1 the test was `readyState > 0`, i.e. "the
+     * browser has loaded some metadata" — which is true of any decorative
+     * <video> a plugin parks in the DOM with a src and preload set (JMSFusion
+     * does exactly this). Such an element never plays, never ends, and never
+     * changes, so it returned 'media_element' on every evaluation for the life
+     * of the page and permanently starved the auto-reload of a tab that had
+     * nothing playing at all. There is nothing to protect at currentTime 0 with
+     * an empty played list: the gate was blocking on the mere existence of a
+     * media element, not on a session.
      * @param {HTMLMediaElement} el
      * @returns {boolean}
      */
@@ -983,8 +1157,11 @@
             }
             if (!src) return false;
             if (el.ended) return false;
-            // Not paused → playing. Paused but readyState > 0 → loaded and parked.
-            return !el.paused || el.readyState > 0;
+            if (!el.paused) return true;                                  // playing
+            if (typeof el.currentTime === 'number' && el.currentTime > 0) return true;
+            if (el.played && el.played.length > 0) return true;
+            if (el.seeking) return true;
+            return false;                                                 // parked, never played
         } catch (_) {
             // Unreadable element: assume it is live rather than reload over it.
             return true;
@@ -994,10 +1171,14 @@
     /**
      * @param {number} idleMs The idle window that must have elapsed (already
      *   floored at MIN_SETTLE_MS by the caller).
+     * @param {boolean} [skipMediaGate] Ignore the <video>/<audio> probe. Set
+     *   ONLY by the starvation escape in tryReload(), after a media element has
+     *   held the gate for the whole retry ladder without a single frame of
+     *   progress. Every other gate still applies.
      * @returns {string|null} A stable reason key why reloading now is unsafe, or
      *   null when a reload is safe. Order is cheapest-and-most-decisive first.
      */
-    function blockReasonFor(idleMs) {
+    function blockReasonFor(idleMs, skipMediaGate) {
         try {
             if (document.visibilityState === 'hidden') return 'hidden';
 
@@ -1018,9 +1199,11 @@
                 if (!dialogs[i].closest('[aria-hidden="true"], [hidden]')) return 'dialog';
             }
 
-            var media = document.querySelectorAll('video, audio');
-            for (var j = 0; j < media.length; j++) {
-                if (hasLiveMedia(/** @type {HTMLMediaElement} */ (media[j]))) return 'media_element';
+            if (!skipMediaGate) {
+                var media = document.querySelectorAll('video, audio');
+                for (var j = 0; j < media.length; j++) {
+                    if (hasLiveMedia(/** @type {HTMLMediaElement} */ (media[j]))) return 'media_element';
+                }
             }
 
             var active = document.activeElement;
@@ -1230,7 +1413,11 @@
      * @param {string} to
      */
     function rememberFlip(name, from, to) {
-        if (!from || !to) return;
+        // `from === to` is not a transition. It can only be reached from a
+        // reload that was armed for an update the server later withdrew, and
+        // recording "X>X" would burn one of the 24 per-tab slots on a record
+        // that can never match anything.
+        if (!from || !to || from === to) return;
         pushTabList(FLIP_KEY, flipRecord(name, from, to), MAX_FLIP_RECORDS);
     }
 
@@ -1294,17 +1481,112 @@
      * @returns {number} Milliseconds, floored at MIN_SETTLE_MS.
      */
     function effectiveIdleWindowMs(pending) {
-        var list = (pending && pending.length) ? pending : registry;
-        var maxIdle = 0;
-        for (var i = 0; i < list.length; i++) {
-            if (list[i].cfg.idleSeconds > maxIdle) maxIdle = list[i].cfg.idleSeconds;
-        }
-        return Math.max(maxIdle * 1000, MIN_SETTLE_MS);
+        var strictest = strictestIdleInstance(pending);
+        return Math.max((strictest ? strictest.cfg.idleSeconds : 0) * 1000, MIN_SETTLE_MS);
     }
 
-    /** Cancel the blocked-reload retry timer. */
+    /**
+     * Which instance IMPOSES the effective idle window — i.e. the one with the
+     * largest idleSeconds among those currently wanting a reload. Exposed
+     * through state() so a snapshot showing a lax instance held back by a
+     * strict sibling names the sibling instead of looking broken.
+     * @param {Array<Object>} [pending]
+     * @returns {Object|null}
+     */
+    function strictestIdleInstance(pending) {
+        var list = (pending && pending.length) ? pending : registry;
+        var chosen = null;
+        for (var i = 0; i < list.length; i++) {
+            if (!chosen || list[i].cfg.idleSeconds > chosen.cfg.idleSeconds) chosen = list[i];
+        }
+        return chosen;
+    }
+
+    /**
+     * Cancel the blocked-reload retry timer AND the pair a discrete interaction
+     * armed. All three exist for one purpose — "re-evaluate the reload soon" —
+     * so they are cancelled together; leaving the interaction pair behind is
+     * what let a hidden or already-satisfied tab keep running safety probes.
+     */
     function clearRetry() {
         if (retryTimer !== null) { clearTimeout(retryTimer); retryTimer = null; }
+        clearInteractionTimers();
+    }
+
+    /** Cancel the task-0 hop and the idle-window wait armed by an interaction. */
+    function clearInteractionTimers() {
+        if (settleHopTimer !== null) { clearTimeout(settleHopTimer); settleHopTimer = null; }
+        if (settleTimer !== null) { clearTimeout(settleTimer); settleTimer = null; }
+    }
+
+    /**
+     * Stand the shared engine down when nothing wants a reload any more (the
+     * last pending instance had its update withdrawn by the server, or
+     * reloaded). Without this a retracted update left the 1Hz ladder, the
+     * interaction timers and a stale lastBlockReason running against nobody.
+     */
+    function releaseEngineIfIdle() {
+        if (pendingInstances().length > 0) return;
+        clearRetry();
+        blockedRetries = 0;
+        lastBlockReason = null;
+        warnedBudgetRefusal = false;
+        resetMediaBlockStreak();
+    }
+
+    /**
+     * A fingerprint of every media element's playback position. Two identical
+     * consecutive readings mean nothing about the page's media moved between
+     * them — no playback, no seek, no source change.
+     * @returns {string|null} null when the DOM could not be probed.
+     */
+    function mediaProgressSignature() {
+        try {
+            var media = document.querySelectorAll('video, audio');
+            var out = '';
+            for (var i = 0; i < media.length; i++) {
+                var el = /** @type {HTMLMediaElement} */ (media[i]);
+                out += (el.currentSrc || el.getAttribute('src') || '') + '@' +
+                    (el.paused ? 'p' : 'r') + ':' +
+                    (typeof el.currentTime === 'number' ? el.currentTime.toFixed(1) : '?') + '|';
+            }
+            return out;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /** Forget the parked-media streak (progress happened, or the block cleared). */
+    function resetMediaBlockStreak() {
+        mediaBlockSince = null;
+        mediaBlockSignature = null;
+    }
+
+    /** @returns {number} How long the current zero-progress media block has lasted. */
+    function mediaBlockedForMs() {
+        return mediaBlockSince === null ? 0 : Date.now() - mediaBlockSince;
+    }
+
+    /**
+     * Note one 'media_element' refusal, restarting the clock whenever anything
+     * about the page's media actually moved.
+     * @returns {boolean} True once the block has outlasted the whole retry
+     *   ladder with zero progress — the parked-media starvation escape.
+     */
+    function noteMediaBlock() {
+        var sig = mediaProgressSignature();
+        if (sig === null) {
+            // The DOM could not be probed; do not accumulate against a reading
+            // we do not have.
+            resetMediaBlockStreak();
+            return false;
+        }
+        if (sig !== mediaBlockSignature) {
+            mediaBlockSignature = sig;
+            mediaBlockSince = Date.now();
+            return false;
+        }
+        return mediaBlockedForMs() >= MEDIA_STARVATION_MS;
     }
 
     /**
@@ -1339,7 +1621,42 @@
         var pending = pendingInstances();
         if (pending.length === 0) return;
 
-        var reason = blockReasonFor(effectiveIdleWindowMs(pending));
+        var idleWindow = effectiveIdleWindowMs(pending);
+        var reason = blockReasonFor(idleWindow);
+
+        // PARKED-MEDIA STARVATION ESCAPE. hasLiveMedia() already refuses to
+        // block on an element that never played, but a media element can also
+        // be stuck: paused at a position and abandoned, or "playing" and frozen
+        // on a stall that never recovers. Either way, once the reason has been
+        // 'media_element' for the whole retry ladder (~10 min at 1Hz) with not
+        // one frame of movement anywhere on the page, this is not a session
+        // being protected — it is layer 3 being switched off permanently by a
+        // decoration. Re-test with the media probe suppressed; EVERY other gate
+        // (dialog, editor, route, fullscreen, visibility, idle) still applies,
+        // so this widens exactly one condition and nothing else. Note that
+        // 'playback_route' is evaluated BEFORE the media probe, so a tab parked
+        // on Jellyfin's own #/video route never reaches this branch — the
+        // escape can only ever apply to media OUTSIDE the player route.
+        if (reason === 'media_element') {
+            if (noteMediaBlock()) {
+                var escaped = blockReasonFor(idleWindow, true);
+                if (!warnedMediaStarvation) {
+                    warnedMediaStarvation = true;
+                    safe(function () {
+                        console.warn(LOG, 'a <video>/<audio> element has held the reload gate for ' +
+                            Math.round(mediaBlockedForMs() / 1000) + 's with no playback progress at ' +
+                            'all — treating it as parked scenery rather than a live session and ' +
+                            'letting the pending reload proceed once the other gates clear' +
+                            (escaped ? ' (still blocked by: ' + escaped + ')' : '') +
+                            '. (Warned once.)');
+                    });
+                }
+                reason = escaped;
+            }
+        } else {
+            resetMediaBlockStreak();
+        }
+
         if (reason) {
             if (reason !== lastBlockReason) {
                 lastBlockReason = reason;
@@ -1408,14 +1725,22 @@
      */
     function onDiscreteInteraction() {
         lastInteractionAt = Date.now();
+        // Supersede any chain an earlier interaction armed. Typing fires
+        // keydown + input per character; without this every keystroke left two
+        // live timers behind that nothing could cancel.
+        clearInteractionTimers();
         if (pendingInstances().length === 0) return;
         clearRetry();
         blockedRetries = 0;
-        setTimeout(function () {
+        settleHopTimer = setTimeout(function () {
+            settleHopTimer = null;
             // Wait out the remaining idle window from THIS interaction.
             var remaining = Math.max(0,
                 lastInteractionAt + effectiveIdleWindowMs(pendingInstances()) - Date.now());
-            setTimeout(function () { safe(tryReload); }, remaining);
+            settleTimer = setTimeout(function () {
+                settleTimer = null;
+                safe(tryReload);
+            }, remaining);
         }, 0);
     }
 
@@ -1535,6 +1860,16 @@
         var candidateVersion = null;
         /** @type {number|null} One-shot timer for the confirmation fetch. */
         var confirmTimer = null;
+        /**
+         * True once this poll cycle has spent its one confirmation fetch. Reset
+         * by any ordinary (non-confirmation) poll, which is what starts a new
+         * cycle. @type {boolean}
+         */
+        var confirmSpentThisCycle = false;
+        /** @type {boolean} One-shot latch for the confirmation-churn warning. */
+        var warnedConfirmChurn = false;
+        /** @type {boolean} True while a version fetch for this instance is in flight. */
+        var fetchInFlight = false;
         /** @type {boolean} One-shot latch for the flap-disarm log line. */
         var warnedFlap = false;
         /** @type {string|null} The version pair auto-reload was disarmed for. */
@@ -1609,19 +1944,31 @@
             lastFetchAt = Date.now();
 
             if (cfg.getVersion) {
-                return Promise.resolve()
-                    .then(function () { return cfg.getVersion(); })
-                    .then(function (v) {
-                        var s = String(v == null ? '' : v).trim();
-                        if (!s) throw new Error('getVersion() returned an empty version');
-                        return s;
-                    });
+                return withTimeout(
+                    Promise.resolve()
+                        .then(function () { return cfg.getVersion(); })
+                        .then(function (v) {
+                            var s = String(v == null ? '' : v).trim();
+                            if (!s) throw new Error('getVersion() returned an empty version');
+                            return s;
+                        }),
+                    VERSION_FETCH_TIMEOUT_MS,
+                    'getVersion()');
             }
 
             if (!cfg.versionUrl) return Promise.reject(new Error('no versionUrl configured'));
 
             var url = cfg.versionUrl + (cfg.versionUrl.indexOf('?') === -1 ? '?' : '&') + '_=' + Date.now();
-            return fetch(url, { cache: 'no-store', credentials: 'same-origin' })
+            // AbortController where it exists, so a timed-out request is also
+            // CANCELLED rather than left holding one of the browser's six
+            // per-host connections. Where it does not, withTimeout still
+            // guarantees the promise settles, which is the load-bearing half.
+            var controller = safe(function () {
+                return typeof AbortController === 'function' ? new AbortController() : null;
+            }, null);
+            var init = { cache: 'no-store', credentials: 'same-origin' };
+            if (controller) init.signal = controller.signal;
+            return withTimeout(fetch(url, init)
                 .then(function (res) {
                     if (!res.ok) throw new Error('HTTP ' + res.status);
                     return res.text();
@@ -1637,7 +1984,10 @@
                     // Guard against an HTML error page being read as a "version".
                     if (s.length > 200 || s.charAt(0) === '<') throw new Error('version response does not look like a version');
                     return s;
-                });
+                }),
+                VERSION_FETCH_TIMEOUT_MS,
+                'version fetch',
+                function () { if (controller) controller.abort(); });
         }
 
         /** Cancel a pending candidate-confirmation fetch. */
@@ -1650,13 +2000,38 @@
          * into a real update. Scheduled rather than waiting for the next
          * ordinary poll, so confirmation costs ~VERSION_CONFIRM_MS instead of a
          * whole pollSeconds.
+         *
+         * BOUNDED TO ONE PER POLL CYCLE (2.1.1). The confirmation poll is
+         * forced, so it also skips MIN_FETCH_GAP_MS; before the bound, a
+         * version source whose successive reads never repeat (per-replica DLL
+         * mtimes behind a round-robin, a volatile versionJsonField) re-armed a
+         * new candidate on every confirmation and produced a self-sustaining
+         * 1.5s fetch loop — ~40x the configured cadence, forever, while never
+         * confirming anything. Now the FIRST sighting in a cycle earns one
+         * confirmation; if that confirmation brings back a THIRD distinct
+         * value, the kit stops chasing and waits for the ordinary poll, which
+         * opens the next cycle.
          */
         function scheduleConfirm() {
             clearConfirmTimer();
             if (cfg.mode === 'off') return;
+            if (confirmSpentThisCycle) {
+                if (!warnedConfirmChurn) {
+                    warnedConfirmChurn = true;
+                    safe(function () {
+                        console.warn(LOG, TAG, 'the version source returned a THIRD distinct identity ' +
+                            'within one poll cycle — that is an unstable source, not a release. Not ' +
+                            'scheduling another confirmation; waiting for the next ordinary poll ' +
+                            '(one confirmation per cycle). Serve one identity per release across all ' +
+                            'nodes. (Warned once.)');
+                    });
+                }
+                return;
+            }
+            confirmSpentThisCycle = true;
             confirmTimer = setTimeout(function () {
                 confirmTimer = null;
-                safe(function () { poll(true); });
+                safe(function () { poll(true, true); });
             }, VERSION_CONFIRM_MS);
         }
 
@@ -1733,6 +2108,32 @@
                 candidateVersion = null;
                 clearConfirmTimer();
                 if (baselineFromBootSeed) baselineFromBootSeed = false;
+
+                // RETRACTED UPDATE. The server has come back to the build this
+                // tab is already running, so a still-armed reload no longer
+                // describes reality — the operator rolled the deploy back while
+                // the reload was refused by a gate (a paused video, an open
+                // dialog, the budget). Left armed it would eventually reload
+                // the tab for nothing, logging "X → X" and spending a budget
+                // slot, in every open tab. Mirrors the reference's watermark
+                // convergence (client-refresh.js: `if (next.BuildId ===
+                // loadedBuildId) pendingSources.delete('plugin')`).
+                //
+                // Gated on notifiedVersion so the UNVERSIONED-BOOT recovery —
+                // which legitimately arms a reload while version ===
+                // baselineVersion, and never announces a version — is not
+                // cancelled by the very poll that recovered it.
+                if (inst.updatePending && notifiedVersion !== null && notifiedVersion !== version) {
+                    inst.updatePending = false;
+                    var retracted = notifiedVersion;
+                    notifiedVersion = null;
+                    safe(function () {
+                        console.log(LOG, TAG, 'update ' + retracted + ' was RETRACTED — the endpoint ' +
+                            'reports ' + version + ' again, which is what this tab is running. ' +
+                            'Disarming the pending reload; a genuine later release re-arms normally.');
+                    });
+                    releaseEngineIfIdle();
+                }
                 return;
             }
 
@@ -1808,18 +2209,28 @@
         }
 
         /**
-         * One poll cycle for this instance: fetch, react, reschedule.
+         * One poll cycle for this instance: fetch and react. Rescheduling is
+         * deliberately NOT chained to this promise — see startPolling().
          * @param {boolean} [force] Skip the min-gap floor (used by checkNow()).
+         * @param {boolean} [isConfirm] This is the one confirmation fetch of the
+         *   current cycle. Any other poll OPENS a new cycle.
          * @returns {Promise<void>}
          */
-        function poll(force) {
+        function poll(force, isConfirm) {
             if (cfg.mode === 'off') return Promise.resolve();
             if (!force && (Date.now() - lastFetchAt) < MIN_FETCH_GAP_MS) return Promise.resolve();
+            // One version request per instance at a time. Without this every
+            // wake of a tab whose endpoint is hanging started another one.
+            if (!force && fetchInFlight) return Promise.resolve();
 
+            if (!isConfirm) confirmSpentThisCycle = false;
+            fetchInFlight = true;
             return fetchVersion().then(function (v) {
+                fetchInFlight = false;
                 warnedFetchFailure = false;
                 safe(function () { onVersion(v); });
             }, function (err) {
+                fetchInFlight = false;
                 // Version-source failure is NOT an update. Warn once, stay quiet
                 // afterwards (a 404'd version.json must not spam the console every
                 // minute), never reload, and keep polling — the endpoint may come
@@ -1833,11 +2244,12 @@
 
         /**
          * Stop this instance's poll timer. Deliberately does NOT touch the
-         * confirmation timer: startPolling() re-arms the loop through here on
-         * every completed poll, and the confirmation is armed from inside that
-         * very poll's onVersion — clearing it here would cancel every
-         * confirmation the moment it was scheduled, and no candidate would ever
-         * be confirmed. Suspending the instance entirely is suspend()'s job.
+         * confirmation timer: startPolling() re-arms the loop through here at
+         * the top of every poll tick, and the confirmation is armed moments
+         * later from inside that same tick's onVersion — clearing it here would
+         * cancel every confirmation the moment it was scheduled, and no
+         * candidate would ever be confirmed. Suspending the instance entirely
+         * is suspend()'s job.
          */
         function stopPolling() {
             if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
@@ -1847,6 +2259,11 @@
          * Suspend this instance completely — used when the tab goes hidden,
          * where "a hidden tab holds ZERO timers" is a promise the kit makes.
          * wake() re-polls and re-observes any candidate from scratch.
+         *
+         * The one timer this cannot reach is the ceiling on a request that was
+         * already in flight when the tab was hidden; it is self-clearing and
+         * lives at most VERSION_FETCH_TIMEOUT_MS, and abandoning a hung request
+         * with no ceiling is the strictly worse trade.
          */
         function suspend() {
             stopPolling();
@@ -1865,14 +2282,24 @@
             if (document.visibilityState === 'hidden') return;
             pollTimer = setTimeout(function () {
                 pollTimer = null;
-                poll().then(startPolling, startPolling);
+                // RE-ARM FIRST, then poll. Hanging the re-arm off the fetch's
+                // promise (`poll().then(startPolling, startPolling)`) meant a
+                // request that never settled stopped the loop permanently: the
+                // handler simply never ran and pollTimer stayed null. Arming
+                // ahead of the request makes the next poll the retry — the same
+                // shape as the reference's `.finally(schedulePoll)` — and the
+                // in-flight guard in poll() keeps a slow endpoint from stacking
+                // requests on top of each other.
+                safe(startPolling);
+                safe(function () { poll(); });
             }, cfg.pollSeconds * 1000);
         }
 
         /** Visibility catch-up for this instance (shared onWake fans out to these). */
         function wake() {
             if (cfg.mode === 'off') return;
-            poll().then(startPolling, startPolling);
+            safe(startPolling);
+            safe(function () { poll(); });
         }
 
         // ── Bootstrap mode: loading this instance's own entry files ──────────
@@ -2067,7 +2494,11 @@
             if (bootstrapMode) {
                 safe(bootstrapEntries);
             } else if (cfg.mode !== 'off') {
-                safe(function () { poll(true).then(startPolling, startPolling); });
+                // Arm the loop before the first fetch, not from its promise: a
+                // first request that never settles must not leave the instance
+                // permanently unpolled (see startPolling).
+                safe(startPolling);
+                safe(function () { poll(true); });
             } else {
                 // mode 'off' switches off POLLING and RELOADS — it does not
                 // switch off layer 2. Without a resolved version, versionedUrl()
@@ -2099,10 +2530,24 @@
          * ("why is the pending auto-reload not happening?") and is null when
          * nothing is pending; the always-computed hypothetical kept its value
          * under the honest name `wouldBlockNow`.
+         *
+         * Since 2.1.1 a PENDING instance is evaluated against the window the
+         * shared engine will actually use — the MAX idleSeconds across every
+         * pending instance — not its own. A lax instance (idleSeconds 0) next
+         * to a strict sibling (300) used to report `blockReason: null, idle:
+         * true` while the engine was deferring with `not_idle`, which reads as
+         * "the reload engine is broken" rather than "a sibling is stricter".
+         * `effectiveIdleWindowMs` / `effectiveIdleWindowFrom` name the window
+         * and the instance imposing it. `wouldBlockNow` deliberately keeps the
+         * instance-local view: it answers "what would block ME".
          * @returns {Object}
          */
         function state() {
-            var idleWindow = Math.max(cfg.idleSeconds * 1000, MIN_SETTLE_MS);
+            var ownIdleWindow = Math.max(cfg.idleSeconds * 1000, MIN_SETTLE_MS);
+            var isPending = cfg.mode === 'auto' && inst.updatePending;
+            var pending = isPending ? pendingInstances() : null;
+            var strictest = isPending ? strictestIdleInstance(pending) : null;
+            var idleWindow = isPending ? effectiveIdleWindowMs(pending) : ownIdleWindow;
             return {
                 kitVersion: KIT_VERSION,
                 name: name,
@@ -2120,12 +2565,13 @@
                 candidateVersion: candidateVersion,
                 flapDisarmedFor: flapDisarmedFor,
                 updatePending: inst.updatePending,
-                blockReason: (cfg.mode === 'auto' && inst.updatePending)
-                    ? blockReasonFor(idleWindow)
-                    : null,
-                wouldBlockNow: cfg.mode === 'auto' ? blockReasonFor(idleWindow) : null,
+                blockReason: isPending ? blockReasonFor(idleWindow) : null,
+                wouldBlockNow: cfg.mode === 'auto' ? blockReasonFor(ownIdleWindow) : null,
                 lastBlockReason: lastBlockReason,
-                idle: (Date.now() - lastInteractionAt) >= Math.max(cfg.idleSeconds * 1000, MIN_SETTLE_MS),
+                idle: (Date.now() - lastInteractionAt) >= idleWindow,
+                idleWindowMs: ownIdleWindow,
+                effectiveIdleWindowMs: idleWindow,
+                effectiveIdleWindowFrom: strictest ? strictest.name : null,
                 msSinceInteraction: Date.now() - lastInteractionAt,
                 pollSeconds: cfg.pollSeconds,
                 idleSeconds: cfg.idleSeconds,
@@ -2256,8 +2702,13 @@
      *
      * Merge order (last wins):
      *   defaults < data-* (rawConfig) < window.JellyfinRefreshKitConfig
-     *   (read by the copy at its own tag; manager fallback for older copies)
-     *   < window.JellyfinRefreshKitConfigs[FINAL resolved name]
+     *   (read by the copy at its own tag, and skipped when it names a different
+     *   adoption; manager fallback for older copies)
+     *   < window.JellyfinRefreshKitConfigs[FINAL resolved name, "#N" included]
+     *
+     * The keyed layer is applied AFTER the name (and any collision suffix) is
+     * settled and after the duplicate-registration test, which is run on the
+     * config as the TAG declared it. See the block comment inside.
      *
      * @param {Object} rawConfig Plain object of tag-level options.
      * @param {string} sourceKitVersion KIT_VERSION of the registering copy.
@@ -2271,11 +2722,11 @@
         var key;
         for (key in raw) { if (Object.prototype.hasOwnProperty.call(raw, key)) merged[key] = raw[key]; }
 
-        // 1.x back-compat. A 2.1+ copy has already merged the singular global
-        // over its own tag config and says so; anything else gets the guarded
-        // manager-side fallback, once, on the first registration (which for a
-        // single-plugin page is exactly the 1.x behaviour: window > data-* >
-        // defaults).
+        // 1.x back-compat. A 2.1+ copy has already SETTLED the singular global
+        // for its own tag (merged or deliberately declined) and says so;
+        // anything else gets the guarded manager-side fallback, once, on the
+        // first registration (which for a single-plugin page is exactly the 1.x
+        // behaviour: window > data-* > defaults).
         if (raw.__singularApplied) {
             singularConfigApplied = true;
         } else if (!singularConfigApplied && registry.length === 0) {
@@ -2283,41 +2734,43 @@
             applySingularWindowConfigFallback(merged);
         }
 
-        // Resolve the FINAL instance name BEFORE consulting the keyed config.
-        // Deriving a provisional name straight off the raw merge made the keyed
-        // form unreachable for exactly the tags that need it most: a tag with
-        // neither data-name nor data-version-url (the eval/JS-Injector shape)
-        // resolved to '' and skipped the lookup entirely, so its "instance-<N>"
-        // name was never addressable.
-        var provisional = normalizeConfig(merged);
-        var name = provisional.name || deriveName(provisional.versionUrl) ||
+        // Resolve the instance name BEFORE consulting the keyed config. Deriving
+        // it straight off the raw merge made the keyed form unreachable for
+        // exactly the tags that need it most: a tag with neither data-name nor
+        // data-version-url (the eval/JS-Injector shape) resolved to '' and
+        // skipped the lookup entirely, so its "instance-<N>" name was never
+        // addressable.
+        //
+        // `declared` is the adoption exactly as the TAG declared it (data-* plus
+        // the singular global), normalized but with no keyed entry merged in.
+        var declared = normalizeConfig(merged);
+        var baseName = declared.name || deriveName(declared.versionUrl) ||
             ('instance-' + (registry.length + 1));
+        var name = baseName;
 
-        // Keyed window config, looked up under the name the instance actually
-        // has. `name` is excluded — and, unlike before, the final name is NOT
-        // re-derived afterwards, so a keyed entry that supplies its own
-        // versionUrl can no longer rename the instance out from under the key
-        // it was found under (which used to break get(name) silently).
-        safe(function () {
-            var all = window.JellyfinRefreshKitConfigs;
-            var entry = (all && typeof all === 'object') ? all[name] : null;
-            if (entry && typeof entry === 'object') {
-                for (var k in entry) {
-                    if (Object.prototype.hasOwnProperty.call(entry, k) && k !== 'name') merged[k] = entry[k];
-                }
-            }
-        });
-
-        var cfg = normalizeConfig(merged);
-        // Stamp the RESOLVED name before the equivalence check, so a duplicate
-        // tag that omitted data-name (name derived from versionUrl) still
-        // compares equal to the instance it duplicates.
-        cfg.name = name;
+        // DEDUPE / COLLISION FIRST, KEYED CONFIG SECOND (2.1.1). Two things
+        // depend on this order:
+        //
+        //  • The equivalence test must run against the adoption AS THE TAG
+        //    DECLARED IT (`declared` below), never against a config a keyed
+        //    entry has already rewritten. A keyed entry that supplies e.g. a
+        //    versionUrl would otherwise MANUFACTURE equivalence between two
+        //    genuinely different adoptions, and the second one would vanish
+        //    into the first's handle with no warning and no entry chain.
+        //  • The keyed lookup must use the name the instance ENDS UP with,
+        //    including the "#2" collision suffix. Looking it up under the
+        //    pre-collision name made `JellyfinRefreshKitConfigs['Foo#2']`
+        //    unreachable — the one key the docs tell you to use for the one
+        //    instance that needs it — while `'Foo'` bled onto an unrelated
+        //    second adoption that merely derived the same folder name.
+        //
+        // (`configsEquivalent` ignores `name` on purpose — see its doc block —
+        // so a duplicate of a "#2" still compares equal to that "#2".)
 
         // Same name again?
         var existing = byName[name];
         if (existing) {
-            if (configsEquivalent(existing.cfg, cfg)) {
+            if (configsEquivalent(existing.declaredCfg, declared)) {
                 // Identical duplicate registration (double-included tag, or two
                 // plugins genuinely shipping the same adoption): silent dedupe.
                 return existing.handle;
@@ -2326,18 +2779,49 @@
             // Checking only the base name is how a third copy of an adoption
             // that already lost the base name became a live "#3" instance and
             // ran the same entry chain a third time.
-            var base = name, n = 2, variant;
-            while ((variant = byName[base + '#' + n])) {
-                if (configsEquivalent(variant.cfg, cfg)) return variant.handle;
+            var n = 2, variant;
+            while ((variant = byName[baseName + '#' + n])) {
+                if (configsEquivalent(variant.declaredCfg, declared)) return variant.handle;
                 n++;
             }
-            name = base + '#' + n;
+            name = baseName + '#' + n;
             safe(function () {
-                console.warn(LOG, 'instance name "' + base + '" already registered with a different ' +
+                console.warn(LOG, 'instance name "' + baseName + '" already registered with a different ' +
                     'config; registering this one as "' + name + '". Give each adoption a distinct ' +
                     'data-name (or versionUrl) to silence this.');
             });
         }
+
+        // Keyed window config, looked up under the instance's FINAL name. A
+        // suffixed instance falls back to the BASE-name entry only when no
+        // entry exists under its own "#N" key, which keeps the ordinary
+        // "same plugin adopted twice" case configurable from one entry while
+        // still letting an author address the second instance precisely.
+        //
+        // `name` is excluded from the merge — and the final name is NOT
+        // re-derived afterwards, so a keyed entry that supplies its own
+        // versionUrl cannot rename the instance out from under the key it was
+        // found under (which used to break get(name) silently).
+        declared.name = name;
+        var keyedConfigKey = null;
+        safe(function () {
+            var all = window.JellyfinRefreshKitConfigs;
+            if (!all || typeof all !== 'object') return;
+            var entry = all[name];
+            var usedKey = name;
+            if (!(entry && typeof entry === 'object') && name !== baseName) {
+                entry = all[baseName];
+                usedKey = baseName;
+            }
+            if (!(entry && typeof entry === 'object')) return;
+            keyedConfigKey = usedKey;
+            for (var k in entry) {
+                if (Object.prototype.hasOwnProperty.call(entry, k) && k !== 'name') merged[k] = entry[k];
+            }
+        });
+
+        var cfg = normalizeConfig(merged);
+        cfg.name = name;
 
         // Two instances must never load the same entry files into one document.
         // The browser serves the second copy from cache at the identical ?v=
@@ -2364,17 +2848,79 @@
             });
         }
 
-        cfg.name = name;
         var sourceVersion = String(sourceKitVersion || 'unknown');
         var inst = createInstance(name, cfg, sourceVersion, entriesSuppressed);
+        // The config AS DECLARED by the tag, i.e. before any keyed entry was
+        // merged. This — not the effective config — is what a later duplicate
+        // registration is compared against (see the dedupe block above).
+        inst.declaredCfg = declared;
+        /** @type {string|null} Which JellyfinRefreshKitConfigs key configured this instance. */
+        inst.keyedConfigKey = keyedConfigKey;
         registry.push(inst);
         byName[name] = inst;
         safe(function () {
             console.log(LOG, 'instance registered: "' + name + '" (kit ' + sourceVersion +
-                ', manager ' + KIT_VERSION + ', ' + registry.length + ' total)');
+                ', manager ' + KIT_VERSION + ', ' + registry.length + ' total)' +
+                (keyedConfigKey ? ', configured by JellyfinRefreshKitConfigs["' + keyedConfigKey + '"]' : ''));
         });
+        scheduleKeyedConfigAudit();
         inst.start();
         return inst.handle;
+    }
+
+    /** @type {boolean} One-shot latch so the keyed-config audit is armed once. */
+    var keyedAuditScheduled = false;
+    /** @type {Object<string, boolean>} Keys already reported as too late. */
+    var warnedLateKeys = Object.create(null);
+
+    /**
+     * Warn about keyed entries that arrived TOO LATE to be applied.
+     *
+     * window.JellyfinRefreshKitConfigs is read synchronously, by each kit tag,
+     * at that tag's own position in the document — so an entry defined BELOW
+     * the kit tags is never consulted. Nothing about the keyed form hints at
+     * that (it is name-addressed, which reads as position-independent), and the
+     * silent failure mode is nasty: an entry meant to force `mode: 'notify'`
+     * does nothing and the tab hard-reloads under the user instead.
+     *
+     * So once the document has finished parsing, compare the keys against the
+     * instances that registered: a key naming a live instance that did NOT
+     * consume it can only mean the entry was defined after that instance's tag.
+     */
+    function auditKeyedConfigs() {
+        safe(function () {
+            var all = window.JellyfinRefreshKitConfigs;
+            if (!all || typeof all !== 'object') return;
+            for (var key in all) {
+                if (!Object.prototype.hasOwnProperty.call(all, key)) continue;
+                if (warnedLateKeys[key]) continue;
+                var inst = byName[key];
+                if (!inst || inst.keyedConfigKey === key) continue;
+                warnedLateKeys[key] = true;
+                safe(function (k) {
+                    return function () {
+                        console.warn(LOG, 'window.JellyfinRefreshKitConfigs["' + k + '"] was NOT applied: ' +
+                            'instance "' + k + '" had already registered by the time the entry existed. ' +
+                            'The keyed config is read synchronously by each kit <script> tag at its own ' +
+                            'position, so it must be defined BEFORE every kit tag — put the inline ' +
+                            'script above them.');
+                    };
+                }(key));
+            }
+        });
+    }
+
+    /** Arm the keyed-config audit once, for after the document has parsed. */
+    function scheduleKeyedConfigAudit() {
+        if (keyedAuditScheduled) return;
+        keyedAuditScheduled = true;
+        safe(function () {
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', function () { safe(auditKeyedConfigs); }, false);
+            } else {
+                setTimeout(function () { safe(auditKeyedConfigs); }, 0);
+            }
+        });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2508,6 +3054,15 @@
                     lastBlockReason: lastBlockReason,
                     msSinceInteraction: Date.now() - lastInteractionAt,
                     effectiveIdleWindowMs: effectiveIdleWindowMs(pending),
+                    effectiveIdleWindowFrom: (function () {
+                        var s = strictestIdleInstance(pending);
+                        return s ? s.name : null;
+                    })(),
+                    blockedRetries: blockedRetries,
+                    // How long a media element has held the gate with zero
+                    // playback progress. At MEDIA_STARVATION_MS the parked-media
+                    // starvation escape fires.
+                    mediaBlockedForMs: mediaBlockedForMs(),
                     effectiveReloadBudget: effectiveReloadBudget(),
                     budgetKey: BUDGET_KEY,
                     budgetWindowMs: BUDGET_WINDOW_MS
