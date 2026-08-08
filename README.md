@@ -108,6 +108,37 @@ If you are hosting the script yourself, replace the `https://cdn.jsdelivr.net/gh
 <br/>  
 <hr style="background: #b4c5fb !important;">
 
+## Automatic Updates & Cache-Busting (Refresh Kit)
+
+This repository now ships `jellyfin-refresh-kit.js` — a single-file, dependency-free companion that eliminates the "clear your browser cache / hard refresh" problem:
+
+- Every script and stylesheet KefinTweaks loads gets a `?v=<version>` cache-buster automatically (no changes to KefinTweaks code — the kit intercepts the loader's URL assignments before the browser fetches).
+- Open tabs poll `version.json` and safely reload themselves when a new release is published — never during playback, over an open dialog, or while the user is typing, and never more than 3 times per minute.
+
+### Recommended setup (self-hosted, bootstrap mode)
+
+Host the repository files under your `jellyfin-web/KefinTweaks/` folder and make the kit the **only** KefinTweaks tag your JS Injector entry adds — it loads the config and injector itself, versioned and in order:
+
+```javascript
+const kit = document.createElement("script");
+kit.src = "/web/KefinTweaks/jellyfin-refresh-kit.js";
+kit.setAttribute("data-version-url", "/web/KefinTweaks/version.json");
+kit.setAttribute("data-version-json-field", "version");
+kit.setAttribute("data-asset-patterns", "/KefinTweaks/");
+kit.setAttribute("data-entry-scripts", "/web/KefinTweaks/kefinTweaks-config.js,/web/KefinTweaks/injector.js");
+document.head.appendChild(kit);
+```
+
+Bump `version.json` whenever you update your hosted files. Open tabs converge on their own within the poll interval (default 60s).
+
+If the version endpoint is ever unreachable, the kit falls back to loading KefinTweaks unversioned after 3 seconds — availability always wins over freshness.
+
+### CDN setup (classic mode)
+
+If you load KefinTweaks from jsDelivr, **pin a version** (`@0.4.9`, not `@latest` — the kit cannot beat the CDN's `@latest` resolution cache) and add the kit tag *before* your existing bootstrap snippet with `data-asset-patterns="/KefinTweaks@"`. The kit then versions the sub-assets and reloads open tabs when `version.json` (fetched from your pinned tag or a raw URL) reports a new release.
+
+Diagnostics: `window.JellyfinRefreshKit.state()` in the browser console shows the resolved version, whether an update is pending, and exactly which safety gate is deferring a reload.
+
 ## Configuration
 
 KefinTweaks includes a comprehensive configuration interface accessible to administrators. The configuration UI allows you to customize all aspects of KefinTweaks without editing code files.
